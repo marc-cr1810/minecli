@@ -10,17 +10,17 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::sync::mpsc::{self, Receiver};
-use uuid::Uuid;
 
 use crate::config::{Config, Account, AccountType, MicrosoftAuth};
 use crate::api::{ApiClient, VersionBrief, VersionDetails, VersionManifest};
 use crate::downloader::{Downloader, ProgressUpdate};
 use crate::launcher::Launcher;
+use crate::instance::Instance;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum Tab {
     Dashboard,
-    Versions,
+    Instances,
     Accounts,
     Settings,
 }
@@ -43,6 +43,25 @@ enum AppState {
         field_idx: usize,
         input_value: String,
     },
+    SelectInstanceFieldToEdit {
+        instance_idx: usize,
+    },
+    EditingInstanceSetting {
+        instance_idx: usize,
+        field_idx: usize,
+        input_value: String,
+    },
+    GameRunning {
+        instance_id: String,
+        instance_name: String,
+        logs: Vec<String>,
+        rx_logs: Receiver<String>,
+        rx_status: Receiver<Result<(), String>>,
+        status: Option<Result<(), String>>,
+        crash_analysis: Option<crate::crash_analyzer::CrashAnalysis>,
+        scroll_offset: usize,
+        auto_scroll: bool,
+    },
     Downloading {
         completed: usize,
         total: usize,
@@ -51,6 +70,24 @@ enum AppState {
         logs: Vec<String>,
         rx: Receiver<ProgressUpdate>,
         version_details: VersionDetails,
+    },
+    CreatingInstanceName,
+    CreatingInstanceVersion {
+        id: String,
+        name: String,
+    },
+    SyncingInstanceMods {
+        completed: usize,
+        total: usize,
+        current_file: String,
+        message: String,
+        logs: Vec<String>,
+        rx: Receiver<ProgressUpdate>,
+    },
+    BackupsMenu {
+        instance_idx: usize,
+        backups: Vec<String>,
+        backups_list_state: ListState,
     },
 }
 
@@ -74,6 +111,10 @@ pub struct App {
     
     // User message display
     status_message: Option<(String, bool)>, // (message, is_error)
+
+    // Instances
+    instances: Vec<Instance>,
+    instances_list_state: ListState,
 }
 
 impl App {
@@ -81,8 +122,9 @@ impl App {
         let config = Config::load();
         let launcher = Launcher::new(config.clone());
         let local_versions = launcher.get_available_local_versions();
+        let instances = Instance::load_all(&config.game_dir);
         
-        Self {
+        let mut app = Self {
             config,
             api_client: ApiClient::new(),
             active_tab: Tab::Dashboard,
@@ -97,7 +139,29 @@ impl App {
             account_list_state: ListState::default(),
             settings_list_state: ListState::default(),
             status_message: None,
+            instances,
+            instances_list_state: ListState::default(),
+        };
+
+        app.select_active_instance_in_list();
+        app
+    }
+
+    fn select_active_instance_in_list(&mut self) {
+        if let Some(ref active_id) = self.config.active_instance {
+            if let Some(idx) = self.instances.iter().position(|inst| &inst.id == active_id) {
+                self.instances_list_state.select(Some(idx));
+            } else if !self.instances.is_empty() {
+                self.instances_list_state.select(Some(0));
+            }
+        } else if !self.instances.is_empty() {
+            self.instances_list_state.select(Some(0));
         }
+    }
+
+    fn refresh_instances(&mut self) {
+        self.instances = Instance::load_all(&self.config.game_dir);
+        self.select_active_instance_in_list();
     }
 
     async fn fetch_manifest(&mut self) {
@@ -149,10 +213,6 @@ impl App {
         }
     }
 
-    fn get_selected_version_id(&self) -> Option<String> {
-        self.config.selected_version.clone()
-    }
-
     fn start_offline_account_flow(&mut self) {
         self.state = AppState::AddOfflineAccount;
         self.status_message = None;
@@ -162,7 +222,6 @@ impl App {
         let (tx, rx) = mpsc::channel::<MicrosoftAuthUpdate>(10);
         let api = ApiClient::new();
 
-        // Spawn Microsoft Device Code polling
         tokio::spawn(async move {
             match api.request_device_code().await {
                 Ok(device_res) => {
@@ -171,7 +230,6 @@ impl App {
                         verification_uri: device_res.verification_uri,
                     }).await;
                     
-                    // Poll Microsoft for authorization
                     let poll_interval = Duration::from_secs(device_res.interval.max(1));
                     let mut expires_in = device_res.expires_in;
                     
@@ -185,7 +243,6 @@ impl App {
 
                         match api.poll_token(&device_res.device_code).await {
                             Ok(Some(token_res)) => {
-                                // Exchange for Xbox and Minecraft Token
                                 match api.login_with_microsoft(&token_res.access_token).await {
                                     Ok(mc_res) => {
                                         match api.fetch_profile(&mc_res.access_token).await {
@@ -216,7 +273,6 @@ impl App {
                                 }
                             }
                             Ok(None) => {
-                                // Still pending
                                 continue;
                             }
                             Err(e) => {
@@ -232,7 +288,6 @@ impl App {
             }
         });
 
-        // Set state to loading while we wait for the first response
         self.state = AppState::AddMicrosoftAccount {
             user_code: "LOADING...".to_string(),
             verification_uri: "...".to_string(),
@@ -314,16 +369,77 @@ impl App {
             self.state = AppState::Normal;
             match res {
                 Ok(version_id) => {
-                    // Refresh local version list
                     let launcher = Launcher::new(self.config.clone());
                     self.local_versions = launcher.get_available_local_versions();
-                    
-                    self.status_message = Some((format!("Successfully downloaded and verified version {}!", version_id), false));
-                    self.config.selected_version = Some(version_id);
-                    let _ = self.config.save();
+                    self.status_message = Some((format!("Successfully downloaded Minecraft version {}!", version_id), false));
                 }
                 Err(e) => {
                     self.status_message = Some((format!("Download failed: {}", e), true));
+                }
+            }
+        }
+
+        // 3. Process Mod Sync state changes
+        let mut sync_finished_state = None;
+        if let AppState::SyncingInstanceMods { ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut logs, ref mut rx } = self.state {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ProgressUpdate::Started { total: t, message: msg } => {
+                        *total = t;
+                        *completed = 0;
+                        *message = msg.clone();
+                        logs.push(format!("Sync: {}", msg));
+                    }
+                    ProgressUpdate::Progress { completed: c, total: t, current_file: f } => {
+                        *completed = c;
+                        *total = t;
+                        *current_file = f.clone();
+                        if c % 5 == 0 || c == t {
+                            logs.push(format!("[{}/{}] Synced {}", c, t, f));
+                        }
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        *message = msg.clone();
+                        logs.push(msg);
+                    }
+                    ProgressUpdate::Finished => {
+                        sync_finished_state = Some(Ok(()));
+                    }
+                    ProgressUpdate::Error(e) => {
+                        sync_finished_state = Some(Err(e));
+                    }
+                }
+            }
+        }
+
+        if let Some(res) = sync_finished_state {
+            self.state = AppState::Normal;
+            match res {
+                Ok(_) => {
+                    self.status_message = Some(("Mods synchronized successfully!".to_string(), false));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Mod sync failed: {}", e), true));
+                }
+            }
+            self.refresh_instances();
+        }
+
+        // 4. Process Game Log streams and termination status
+        if let AppState::GameRunning { ref mut logs, ref mut rx_logs, ref mut rx_status, ref mut status, ref mut crash_analysis, ref mut scroll_offset, auto_scroll, ref instance_id, .. } = self.state {
+            while let Ok(line) = rx_logs.try_recv() {
+                logs.push(line);
+                if auto_scroll {
+                    *scroll_offset = logs.len();
+                }
+            }
+            while let Ok(res) = rx_status.try_recv() {
+                let res_val: Result<(), String> = res;
+                *status = Some(res_val.clone());
+                if let Err(_) = res_val {
+                    let instance_path = self.config.game_dir.join("instances").join(instance_id);
+                    let latest_log_content = logs.join("\n");
+                    *crash_analysis = crate::crash_analyzer::analyze_crash(&instance_path, &latest_log_content);
                 }
             }
         }
@@ -338,7 +454,6 @@ impl App {
                 let game_dir = self.config.game_dir.clone();
                 let details_clone = details.clone();
 
-                // Save details JSON
                 let details_json_path = game_dir
                     .join("versions")
                     .join(&details.id)
@@ -351,9 +466,7 @@ impl App {
                 }
 
                 tokio::spawn(async move {
-                    if let Err(_e) = downloader.download_version(&game_dir, &details_clone).await {
-                        // Download failed
-                    }
+                    let _ = downloader.download_version(&game_dir, &details_clone).await;
                 });
 
                 self.state = AppState::Downloading {
@@ -374,10 +487,18 @@ impl App {
     }
 
     async fn run_minecraft(&mut self) {
-        let version_id = match self.get_selected_version_id() {
-            Some(v) => v,
+        let active_id = match &self.config.active_instance {
+            Some(id) => id,
             None => {
-                self.status_message = Some(("No version selected. Please select a version in the 'Versions' tab.".to_string(), true));
+                self.status_message = Some(("No active instance selected. Please select an instance in the 'Instances' tab.".to_string(), true));
+                return;
+            }
+        };
+
+        let instance = match Instance::load(active_id, self.config.game_dir.join("instances").join(active_id)) {
+            Ok(inst) => inst,
+            Err(e) => {
+                self.status_message = Some((format!("Failed to load active instance: {}", e), true));
                 return;
             }
         };
@@ -390,74 +511,69 @@ impl App {
             }
         };
 
-        // Suspend TUI
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = crossterm::execute!(stdout, LeaveAlternateScreen, crossterm::event::DisableMouseCapture);
-        println!("==================================================");
-        println!("Launching Minecraft {} as {}...", version_id, account.username);
-        println!("Game outputs will print below. Please wait...");
-        println!("==================================================");
+        let (tx_logs, rx_logs) = mpsc::channel::<String>(1000);
+        let (tx_status, rx_status) = mpsc::channel::<Result<(), String>>(1);
 
         let launcher = Launcher::new(self.config.clone());
-        let launch_res = launcher.launch(&version_id, &account).await;
+        let inst_clone = instance.clone();
+        let acc_clone = account.clone();
 
-        println!("\n==================================================");
-        if let Err(e) = launch_res {
-            println!("Game launch failed: {}", e);
-            println!("Press enter to return to the launcher.");
-            let mut temp = String::new();
-            let _ = io::stdin().read_line(&mut temp);
-        } else {
-            println!("Minecraft game closed successfully.");
-            println!("Press enter to return to the launcher.");
-            let mut temp = String::new();
-            let _ = io::stdin().read_line(&mut temp);
-        }
+        tokio::spawn(async move {
+            let res = launcher.launch_with_logs(&inst_clone, &acc_clone, Some(tx_logs)).await;
+            let _ = tx_status.send(res).await;
+        });
 
-        // Restore TUI
-        let _ = enable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), EnterAlternateScreen, crossterm::event::EnableMouseCapture);
-        self.status_message = None;
+        self.state = AppState::GameRunning {
+            instance_id: instance.id.clone(),
+            instance_name: instance.config.name.clone(),
+            logs: Vec::new(),
+            rx_logs,
+            rx_status,
+            status: None,
+            crash_analysis: None,
+            scroll_offset: 0,
+            auto_scroll: true,
+        };
     }
 
     fn draw(&mut self, f: &mut ratatui::Frame) {
         let size = f.size();
 
-        // Theme colors
-        let bg_color = Color::Rgb(15, 17, 26); // Deep blue-gray dark mode
-        let border_color = Color::Rgb(86, 73, 150); // Muted violet
-        let text_color = Color::Rgb(220, 222, 235); // Ice white
-        let active_color = Color::Rgb(46, 204, 113); // Emerald green for play
-        let select_color = Color::Rgb(142, 68, 173); // Purple accent
+        let bg_color = Color::Rgb(15, 17, 26); 
+        let border_color = Color::Rgb(86, 73, 150); 
+        let select_color = Color::Rgb(142, 68, 173); 
+
+        if let AppState::GameRunning { .. } = self.state {
+            self.draw_game_logs(f, size, select_color, border_color);
+            return;
+        }
+        let text_color = Color::Rgb(220, 222, 235); 
+        let active_color = Color::Rgb(46, 204, 113); 
 
         let main_block = Block::default()
             .bg(bg_color)
             .style(Style::default().fg(text_color));
         f.render_widget(main_block, size);
 
-        // Core Layout: Title, Main content (Sidebar + Body), Help bar
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Title Banner
-                Constraint::Min(5),    // Main content area
-                Constraint::Length(3), // Footer Help Bar
+                Constraint::Length(3), 
+                Constraint::Min(5),    
+                Constraint::Length(3), 
             ])
             .split(size);
 
-        // 1. Draw Title Banner
         let logo = format!(" ✦ MineCLI Terminal Launcher ✦ ");
         let logo_p = Paragraph::new(logo)
             .style(Style::default().fg(Color::Rgb(155, 89, 182)).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(border_color)));
         f.render_widget(logo_p, chunks[0]);
 
-        // Draw Status Message if any
         if let Some((ref msg, is_error)) = self.status_message {
             let color = if is_error { Color::Red } else { Color::Cyan };
             let status_rect = Rect {
-                x: chunks[0].x + chunks[0].width - 45,
+                x: chunks[0].x + chunks[0].width.saturating_sub(45),
                 y: chunks[0].y + 1,
                 width: 42,
                 height: 1,
@@ -468,37 +584,31 @@ impl App {
             f.render_widget(status_p, status_rect);
         }
 
-        // 2. Draw Main content area (Sidebar + Body)
         let main_layout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(22), // Sidebar width
-                Constraint::Min(20),    // Body width
+                Constraint::Length(22), 
+                Constraint::Min(20),    
             ])
             .split(chunks[1]);
 
-        // Draw Sidebar Menu
         self.draw_sidebar(f, main_layout[0], border_color, select_color);
 
-        // Draw active view body
         match self.active_tab {
             Tab::Dashboard => self.draw_dashboard(f, main_layout[1], border_color, active_color),
-            Tab::Versions => self.draw_versions(f, main_layout[1], border_color, select_color),
+            Tab::Instances => self.draw_instances(f, main_layout[1], border_color, select_color),
             Tab::Accounts => self.draw_accounts(f, main_layout[1], border_color, select_color),
             Tab::Settings => self.draw_settings(f, main_layout[1], border_color, select_color),
         }
 
-        // 3. Draw Footer Help Bar
         self.draw_footer(f, chunks[2], border_color);
-
-        // Render modal overlay states (like text inputs, device codes)
-        self.draw_overlays(f, size, select_color);
+        self.draw_overlays(f, size, select_color, border_color);
     }
 
     fn draw_sidebar(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
         let menu_items = vec![
             "[D] Dashboard",
-            "[V] Versions",
+            "[I] Instances",
             "[A] Accounts",
             "[S] Settings",
         ];
@@ -506,7 +616,7 @@ impl App {
         let list_items: Vec<ListItem> = menu_items.iter().enumerate().map(|(idx, item)| {
             let tab_match = match idx {
                 0 => self.active_tab == Tab::Dashboard,
-                1 => self.active_tab == Tab::Versions,
+                1 => self.active_tab == Tab::Instances,
                 2 => self.active_tab == Tab::Accounts,
                 3 => self.active_tab == Tab::Settings,
                 _ => false,
@@ -530,6 +640,142 @@ impl App {
         f.render_widget(menu_list, rect);
     }
 
+    fn draw_game_logs(&self, f: &mut ratatui::Frame, size: Rect, _select_color: Color, border_color: Color) {
+        if let AppState::GameRunning { ref instance_name, ref logs, ref status, ref crash_analysis, scroll_offset, auto_scroll, .. } = self.state {
+            f.render_widget(Clear, size);
+            let bg_block = Block::default().bg(Color::Rgb(15, 17, 26));
+            f.render_widget(bg_block, size);
+
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // Title
+                    Constraint::Min(5),    // Log content & crash card
+                    Constraint::Length(3), // Footer
+                ])
+                .split(size);
+
+            // Title
+            let status_text = match status {
+                None => Span::styled(" RUNNING ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Some(Ok(_)) => Span::styled(" EXITED SUCCESSFULLY ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Some(Err(_)) => Span::styled(" CRASHED ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            };
+            let title_line = Line::from(vec![
+                Span::raw(" Game Session: "),
+                Span::styled(instance_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::raw(" | Status: "),
+                status_text,
+            ]);
+            let title_p = Paragraph::new(title_line)
+                .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(border_color)))
+                .style(Style::default().fg(Color::Rgb(200, 200, 220)));
+            f.render_widget(title_p, main_chunks[0]);
+
+            // Layout center area
+            let (logs_area, crash_area) = if crash_analysis.is_some() {
+                let center_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([
+                        Constraint::Percentage(55),
+                        Constraint::Percentage(45),
+                    ])
+                    .split(main_chunks[1]);
+                (center_chunks[0], Some(center_chunks[1]))
+            } else {
+                (main_chunks[1], None)
+            };
+
+            // Render log viewer
+            let logs_block = Block::default()
+                .title(format!(" Game Logs (Auto-scroll: {}) ", if auto_scroll { "ON" } else { "OFF (Press [End] to lock)" }))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if status.is_none() { Color::Green } else { border_color }));
+            
+            // Format log lines to show in paragraph
+            let display_height = logs_area.height.saturating_sub(2) as usize;
+            
+            // Slice logs based on scroll offset
+            let scroll_offset = if auto_scroll {
+                logs.len().saturating_sub(display_height)
+            } else {
+                scroll_offset.min(logs.len().saturating_sub(1))
+            };
+
+            let start = scroll_offset;
+            let end = (start + display_height).min(logs.len());
+            let sliced_logs = if start < logs.len() {
+                &logs[start..end]
+            } else {
+                &[]
+            };
+
+            let log_lines: Vec<Line> = sliced_logs.iter().map(|line| {
+                let fg = if line.contains("[ERROR]") || line.contains("[stderr]") || line.contains("Error") || line.contains("Exception") {
+                    Color::Red
+                } else if line.contains("[WARN]") || line.contains("Warning") {
+                    Color::Yellow
+                } else if line.contains("[INFO]") {
+                    Color::Rgb(180, 180, 200)
+                } else {
+                    Color::Rgb(140, 140, 150)
+                };
+                Line::from(Span::styled(line, Style::default().fg(fg)))
+            }).collect();
+
+            let logs_p = Paragraph::new(log_lines).block(logs_block);
+            f.render_widget(logs_p, logs_area);
+
+            // Render crash diagnostics card if present
+            if let Some(crash) = crash_analysis {
+                if let Some(area) = crash_area {
+                    let card_block = Block::default()
+                        .title(" Crash Diagnostics ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Double)
+                        .border_style(Style::default().fg(Color::Red));
+
+                    let mut card_text = vec![
+                        Line::from(Span::styled(&crash.title, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from(Span::styled("Description:", Style::default().fg(Color::Rgb(200, 200, 210)).add_modifier(Modifier::BOLD))),
+                    ];
+                    
+                    card_text.push(Line::from(Span::raw(&crash.description)));
+                    card_text.push(Line::from(""));
+                    card_text.push(Line::from(Span::styled("Suggested Solutions:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+                    
+                    for sol in &crash.possible_solutions {
+                        card_text.push(Line::from(Span::styled(format!("• {}", sol), Style::default().fg(Color::White))));
+                    }
+
+                    let card_p = Paragraph::new(card_text)
+                        .block(card_block)
+                        .wrap(Wrap { trim: true });
+                    f.render_widget(card_p, area);
+                }
+            }
+
+            // Render footer
+            let footer_text = match status {
+                None => {
+                    "● Game is running. Close Minecraft to return to launcher.  |  [Up/Down]: Scroll Logs"
+                }
+                Some(Ok(_)) => {
+                    "✔ Game closed successfully. Press [Esc] to return to menu.  |  [Up/Down]: Scroll Logs"
+                }
+                Some(Err(_)) => {
+                    "❌ Game crashed! See diagnostics on the right. Press [Esc] to return to menu.  |  [Up/Down]: Scroll Logs"
+                }
+            };
+            let footer_p = Paragraph::new(footer_text)
+                .style(Style::default().fg(Color::Rgb(150, 150, 160)))
+                .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(border_color)))
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(footer_p, main_chunks[2]);
+        }
+    }
+
     fn draw_dashboard(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, active_color: Color) {
         let main_block = Block::default()
             .title(" Launcher Dashboard ")
@@ -542,23 +788,22 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5), // Launch Game Panel
-                Constraint::Length(6), // Selected Settings Profile
-                Constraint::Min(4),    // Instructions / Welcome
+                Constraint::Length(5), 
+                Constraint::Length(6), 
+                Constraint::Min(4),    
             ])
             .split(inner);
 
-        // A. Launch Game Panel
-        let version_str = self.get_selected_version_id().unwrap_or_else(|| "None selected".to_string());
+        let active_instance_str = self.config.active_instance.clone().unwrap_or_else(|| "None".to_string());
         let account_str = self.active_account_desc();
         
-        let launch_btn_text = if self.config.selected_version.is_some() && self.config.active_account_uuid.is_some() {
-            format!(" ► LAUNCH MINECRAFT {} (Press Enter or 'L') ◄ ", version_str)
+        let launch_btn_text = if self.config.active_instance.is_some() && self.config.active_account_uuid.is_some() {
+            format!(" ► LAUNCH INSTANCE '{}' (Press Enter or 'L') ◄ ", active_instance_str)
         } else {
-            " ⚠️ Setup Required (Select version & account) ⚠️ ".to_string()
+            " ⚠️ Setup Required (Select instance & account) ⚠️ ".to_string()
         };
 
-        let launch_btn_style = if self.config.selected_version.is_some() && self.config.active_account_uuid.is_some() {
+        let launch_btn_style = if self.config.active_instance.is_some() && self.config.active_account_uuid.is_some() {
             Style::default().fg(active_color).add_modifier(Modifier::BOLD).bg(Color::Rgb(20, 40, 25))
         } else {
             Style::default().fg(Color::Rgb(230, 126, 34)).add_modifier(Modifier::BOLD)
@@ -571,19 +816,17 @@ impl App {
         
         f.render_widget(launch_btn, chunks[0]);
 
-        // B. Selected Settings Profile
         let details_text = vec![
-            Line::from(vec![Span::raw("Active Player:  "), Span::styled(account_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::raw("Game Version:   "), Span::styled(version_str, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::raw("Game Directory: "), Span::styled(self.config.game_dir.to_string_lossy().to_string(), Style::default().fg(Color::Yellow))]),
-            Line::from(vec![Span::raw("JVM Memory:     "), Span::styled(self.config.jvm_args.join(" "), Style::default().fg(Color::Yellow))]),
+            Line::from(vec![Span::raw("Active Player:   "), Span::styled(account_str, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::raw("Active Instance: "), Span::styled(active_instance_str, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::raw("Game Directory:  "), Span::styled(self.config.game_dir.to_string_lossy().to_string(), Style::default().fg(Color::Yellow))]),
+            Line::from(vec![Span::raw("JVM Memory:      "), Span::styled(self.config.jvm_args.join(" "), Style::default().fg(Color::Yellow))]),
         ];
         let details = Paragraph::new(details_text)
             .block(Block::default().title(" Active Session Details ").borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
         
         f.render_widget(details, chunks[1]);
 
-        // C. Welcome Banner
         let ascii_art = r#"
   __  __ _            _____ _      _____ 
  |  \/  (_)          / ____| |    |_   _|
@@ -592,7 +835,7 @@ impl App {
  | |  | | | | | |  __/ |____| |____ _| |_ 
  |_|  |_|_|_| |_|\___|\_____|______|_____|
         "#;
-        let welcome_text = format!("{}\n\nWelcome to MineCLI. Select a version and account from the side tabs to get started.\nPress 'q' at any time to quit.", ascii_art);
+        let welcome_text = format!("{}\n\nWelcome to MineCLI. Select an instance and account from the tabs to get started.\nPress 'q' at any time to quit.", ascii_art);
         let welcome = Paragraph::new(welcome_text)
             .alignment(ratatui::layout::Alignment::Center)
             .style(Style::default().fg(Color::Rgb(130, 130, 150)))
@@ -600,9 +843,9 @@ impl App {
         f.render_widget(welcome, chunks[2]);
     }
 
-    fn draw_versions(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
+    fn draw_instances(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
         let main_block = Block::default()
-            .title(" Minecraft Version Manager ")
+            .title(" Minecraft Instance Manager ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color));
         
@@ -612,56 +855,125 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Search bar
-                Constraint::Min(4),    // Version list
+                Constraint::Min(4),    
+                Constraint::Length(5), 
             ])
             .split(inner);
 
-        // A. Search Bar
-        let release_status = if self.filter_releases { "● Releases (F1)" } else { "○ Releases (F1)" };
-        let snapshot_status = if self.filter_snapshots { "● Snapshots (F2)" } else { "○ Snapshots (F2)" };
-        
-        let search_text = format!(" Search: {:<30} | {} | {}", self.version_search_query, release_status, snapshot_status);
-        let search_p = Paragraph::new(search_text)
-            .style(Style::default().fg(Color::White))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
-        f.render_widget(search_p, chunks[0]);
+        let list_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(chunks[0]);
 
-        // B. Version List
-        let list_items: Vec<ListItem> = self.filtered_version_briefs.iter().map(|v| {
-            let is_local = self.local_versions.contains(&v.id);
-            let is_selected = self.config.selected_version.as_deref() == Some(&v.id);
-
-            let status_span = if is_local {
-                Span::styled(" [LOCAL] ", Style::default().fg(Color::Green))
-            } else {
-                Span::styled(" [CLOUD] ", Style::default().fg(Color::Yellow))
-            };
-
-            let select_span = if is_selected {
-                Span::styled(" ★ ACTIVE ★ ", Style::default().fg(Color::Rgb(155, 89, 182)).add_modifier(Modifier::BOLD))
+        let list_items: Vec<ListItem> = self.instances.iter().map(|inst| {
+            let is_active = self.config.active_instance.as_ref() == Some(&inst.id);
+            
+            let status_span = if is_active {
+                Span::styled(" [ACTIVE] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             } else {
                 Span::raw("")
             };
 
             let item_line = Line::from(vec![
-                Span::styled(format!(" {:<18}", v.id), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({:<10})", v.r#type), Style::default().fg(Color::Rgb(160, 160, 170))),
+                Span::styled(format!(" {:<18}", inst.config.name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ID: {:<12}", inst.id), Style::default().fg(Color::Rgb(160, 160, 170))),
+                Span::styled(format!(" Version: {:<10}", inst.config.version), Style::default().fg(Color::Cyan)),
                 status_span,
-                select_span,
             ]);
 
             ListItem::new(item_line)
         }).collect();
 
-        // Render List with State
         let list = List::new(list_items)
-            .block(Block::default().borders(Borders::ALL).title(" Available Versions ").border_style(Style::default().fg(border_color)))
+            .block(Block::default().borders(Borders::ALL).title(" Available Instances ").border_style(Style::default().fg(border_color)))
             .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-        // Use standard state rendering
-        let mut state = self.version_list_state.clone();
-        f.render_stateful_widget(list, chunks[1], &mut state);
+        let mut state = self.instances_list_state.clone();
+        f.render_stateful_widget(list, list_chunks[0], &mut state);
+
+        // Highlighted instance detail panel on the right
+        let selected_idx = self.instances_list_state.selected().unwrap_or(0);
+        let highlighted_instance = self.instances.get(selected_idx);
+
+        if let Some(inst) = highlighted_instance {
+            let mods_count = inst.config.mods.as_ref().map(|m| m.len()).unwrap_or(0);
+            let hooks_status = match (&inst.config.pre_launch, &inst.config.post_exit) {
+                (Some(_), Some(_)) => "Pre & Post Hooks active",
+                (Some(_), None) => "Pre Hook active",
+                (None, Some(_)) => "Post Hook active",
+                (None, None) => "None",
+            };
+            let jre_path_str = inst.config.java_path.as_deref().unwrap_or("None (Default)");
+            let jre_ver_str = match inst.config.java_version {
+                Some(v) => format!("Java {} (Forced)", v),
+                None => "Auto-detect (Recommended)".to_string(),
+            };
+
+            let details_text = vec![
+                Line::from(vec![
+                    Span::styled("Name:              ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(&inst.config.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("ID:                ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(&inst.id, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Minecraft Version: ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(&inst.config.version, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Java Runtime Path: ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(jre_path_str, Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Forced JRE Version:", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(jre_ver_str, Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Declared Mods:     ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(mods_count.to_string(), Style::default().fg(Color::Green)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Launch Hooks:      ", Style::default().fg(Color::Rgb(150, 150, 160))),
+                    Span::styled(hooks_status, Style::default().fg(Color::Magenta)),
+                ]),
+            ];
+
+            let details_p = Paragraph::new(details_text)
+                .block(Block::default().title(" Selected Instance Config ").borders(Borders::ALL).border_style(Style::default().fg(border_color)));
+            f.render_widget(details_p, list_chunks[1]);
+        } else {
+            let details_p = Paragraph::new("No instance highlighted")
+                .block(Block::default().title(" Selected Instance Config ").borders(Borders::ALL).border_style(Style::default().fg(border_color)));
+            f.render_widget(details_p, list_chunks[1]);
+        }
+
+        let help_text = vec![
+            Line::from(vec![
+                Span::styled(" [N]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), 
+                Span::raw(" New Instance       "), 
+                Span::styled("[D]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Delete Instance   "),
+                Span::styled("[S]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Sync Mods"),
+            ]),
+            Line::from(vec![
+                Span::styled(" [Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Set Active         "), 
+                Span::styled("[B]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Backups & Snapshots"),
+                Span::styled("   [E]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Edit Settings"),
+            ]),
+        ];
+        
+        let help_p = Paragraph::new(help_text)
+            .block(Block::default().title(" Instance Actions ").borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
+        f.render_widget(help_p, chunks[1]);
     }
 
     fn draw_accounts(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
@@ -676,12 +988,11 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(4),    // Account list
-                Constraint::Length(5), // Quick instructions / actions
+                Constraint::Min(4),    
+                Constraint::Length(5), 
             ])
             .split(inner);
 
-        // A. Account List
         let list_items: Vec<ListItem> = self.config.accounts.iter().map(|acc| {
             let is_active = self.config.active_account_uuid.as_deref() == Some(&acc.uuid);
             
@@ -713,7 +1024,6 @@ impl App {
         let mut state = self.account_list_state.clone();
         f.render_stateful_widget(list, chunks[0], &mut state);
 
-        // B. Quick Actions Help Panel
         let help_text = vec![
             Line::from(vec![Span::styled(" [A]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" Add Account               "), Span::styled("[O]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), Span::raw(" Add Offline Profile")]),
             Line::from(vec![Span::styled(" [Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)), Span::raw(" Select Profile Active     "), Span::styled("[X]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)), Span::raw(" Delete Profile")]),
@@ -736,12 +1046,11 @@ impl App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(4),    // List of settings fields
-                Constraint::Length(4), // Edit help instructions
+                Constraint::Min(4),    
+                Constraint::Length(4), 
             ])
             .split(inner);
 
-        // A. List of Settings Fields
         let settings_list = vec![
             ("Game Directory", self.config.game_dir.to_string_lossy().to_string()),
             ("Java Executable Path", self.config.java_path.to_string_lossy().to_string()),
@@ -762,7 +1071,6 @@ impl App {
         let mut state = self.settings_list_state.clone();
         f.render_stateful_widget(list, chunks[0], &mut state);
 
-        // B. Instructions Help
         let help_text = "Press [Enter] on a selected preference to edit its value.\nChanges are automatically saved to your configuration file.";
         let help_p = Paragraph::new(help_text)
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
@@ -786,13 +1094,13 @@ impl App {
         f.render_widget(footer_p, rect);
     }
 
-    fn draw_overlays(&self, f: &mut ratatui::Frame, size: Rect, select_color: Color) {
+    fn draw_overlays(&self, f: &mut ratatui::Frame, size: Rect, select_color: Color, border_color: Color) {
         match self.state {
             AppState::Normal => {}
             
             AppState::AddOfflineAccount => {
                 let area = self.get_centered_rect(50, 20, size);
-                f.render_widget(Clear, area); // Clear underlying pixels
+                f.render_widget(Clear, area); 
                 
                 let block = Block::default()
                     .title(" Add Offline Account Profile ")
@@ -806,14 +1114,14 @@ impl App {
                     .constraints([
                         Constraint::Length(1),
                         Constraint::Length(1),
-                        Constraint::Length(3), // Input box
-                        Constraint::Length(2), // Help text
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
                     ])
                     .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
 
                 f.render_widget(Paragraph::new("Enter desired username:"), inner_layout[1]);
 
-                let input_p = Paragraph::new(self.version_search_query.clone()) // Reuse query string as buffer or temporary value
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
                     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
                 f.render_widget(input_p, inner_layout[2]);
 
@@ -821,6 +1129,93 @@ impl App {
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::CreatingInstanceName => {
+                let area = self.get_centered_rect(50, 20, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Create New Instance ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter instance name/ID (e.g. survival-1.20):"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Next, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::CreatingInstanceVersion { ref id, ref name } => {
+                let area = self.get_centered_rect(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Choose Version for '{}' (ID: {}) ", name, id))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), 
+                        Constraint::Min(4),    
+                    ])
+                    .split(inner);
+
+                let release_status = if self.filter_releases { "● Releases (F1)" } else { "○ Releases (F1)" };
+                let snapshot_status = if self.filter_snapshots { "● Snapshots (F2)" } else { "○ Snapshots (F2)" };
+                
+                let search_text = format!(" Search: {:<30} | {} | {}", self.version_search_query, release_status, snapshot_status);
+                let search_p = Paragraph::new(search_text)
+                    .style(Style::default().fg(Color::White))
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
+                f.render_widget(search_p, chunks[0]);
+
+                let list_items: Vec<ListItem> = self.filtered_version_briefs.iter().map(|v| {
+                    let is_local = self.local_versions.contains(&v.id);
+                    let status_span = if is_local {
+                        Span::styled(" [LOCAL] ", Style::default().fg(Color::Green))
+                    } else {
+                        Span::styled(" [CLOUD] ", Style::default().fg(Color::Yellow))
+                    };
+
+                    let item_line = Line::from(vec![
+                        Span::styled(format!(" {:<18}", v.id), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" ({:<10})", v.r#type), Style::default().fg(Color::Rgb(160, 160, 170))),
+                        status_span,
+                    ]);
+
+                    ListItem::new(item_line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Select Minecraft Version (Enter to Select, Esc to Cancel) ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = self.version_list_state.clone();
+                f.render_stateful_widget(list, chunks[1], &mut state);
             }
 
             AppState::AddMicrosoftAccount { ref user_code, ref verification_uri, .. } => {
@@ -838,11 +1233,11 @@ impl App {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(2), // Intro
-                        Constraint::Length(3), // URL
-                        Constraint::Length(4), // Big Code Box
-                        Constraint::Length(3), // Polling indicator
-                        Constraint::Length(2), // Escape help
+                        Constraint::Length(2), 
+                        Constraint::Length(3), 
+                        Constraint::Length(4), 
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
                     ])
                     .split(inner);
 
@@ -904,8 +1299,95 @@ impl App {
                 f.render_widget(help, chunks[2]);
             }
 
+            AppState::SelectInstanceFieldToEdit { instance_idx: _ } => {
+                let area = self.get_centered_rect(55, 12, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(" Select Instance Setting to Edit ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                f.render_widget(Paragraph::new("Select a field to configure:"), chunks[0]);
+
+                let opt1 = Line::from(vec![
+                    Span::styled(" [1]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(" Java Executable Path (Override JRE path)"),
+                ]);
+                let opt2 = Line::from(vec![
+                    Span::styled(" [2]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(" Java Version (Force specific major JRE version)"),
+                ]);
+
+                f.render_widget(Paragraph::new(opt1), chunks[2]);
+                f.render_widget(Paragraph::new(opt2), chunks[3]);
+
+                let help = Paragraph::new("Press [1] or [2] to select, [Esc] to Cancel")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)));
+                f.render_widget(help, chunks[4]);
+            }
+
+            AppState::EditingInstanceSetting { field_idx, ref input_value, .. } => {
+                let area = self.get_centered_rect(65, 12, size);
+                f.render_widget(Clear, area);
+
+                let field_name = match field_idx {
+                    1 => "Java Executable Path",
+                    2 => "Java JRE Version",
+                    _ => "Instance Setting",
+                };
+
+                let block = Block::default()
+                    .title(format!(" Edit {} ", field_name))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(2),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let desc = match field_idx {
+                    1 => "Enter absolute path to 'java' binary (leave empty/type 'clear' to reset):",
+                    2 => "Enter Java version (e.g. 8, 17, 21 or enter '0' to auto-detect):",
+                    _ => "Enter setting value:",
+                };
+                f.render_widget(Paragraph::new(desc), chunks[0]);
+
+                let input_p = Paragraph::new(input_value.as_str())
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, chunks[1]);
+
+                let help = Paragraph::new("Press [Enter] to Save, [Esc] to Cancel")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)));
+                f.render_widget(help, chunks[2]);
+            }
+
             AppState::Downloading { completed, total, ref current_file, ref message, ref logs, .. } => {
-                f.render_widget(Clear, size); // Take over entire window during download
+                f.render_widget(Clear, size); 
                 
                 let block = Block::default()
                     .title(" Downloading Game Data Files ")
@@ -918,21 +1400,19 @@ impl App {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3), // Progress Info Title
-                        Constraint::Length(3), // Visual Progress Bar
-                        Constraint::Min(4),    // Log list
+                        Constraint::Length(3), 
+                        Constraint::Length(3), 
+                        Constraint::Min(4),    
                     ])
                     .split(inner);
 
-                // A. Progress Info Title
                 let pct = if total > 0 { (completed * 100) / total } else { 0 };
                 let title_text = format!("{} Progress: {}% ({}/{})", message, pct, completed, total);
                 let current_p = Paragraph::new(format!("{}\nFile: {}", title_text, current_file))
                     .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
                 f.render_widget(current_p, chunks[0]);
 
-                // B. Visual Progress Bar
-                let inner_width = chunks[1].width as usize - 2; // borders
+                let inner_width = chunks[1].width as usize - 2; 
                 let filled_chars = if total > 0 { (completed * inner_width) / total } else { 0 };
                 let mut bar = String::new();
                 for _ in 0..filled_chars {
@@ -946,7 +1426,6 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
                 f.render_widget(bar_p, chunks[1]);
 
-                // C. Log List
                 let log_items: Vec<ListItem> = logs.iter().rev().take(15).map(|log| {
                     ListItem::new(log.as_str()).style(Style::default().fg(Color::Rgb(150, 150, 160)))
                 }).collect();
@@ -955,6 +1434,90 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Download Event Log "));
                 f.render_widget(log_list, chunks[2]);
             }
+
+            AppState::SyncingInstanceMods { completed, total, ref current_file, ref message, ref logs, .. } => {
+                f.render_widget(Clear, size);
+                
+                let block = Block::default()
+                    .title(" Syncing Mod Files ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, size);
+
+                let inner = size.inner(&ratatui::layout::Margin { horizontal: 3, vertical: 2 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), 
+                        Constraint::Length(3), 
+                        Constraint::Min(4),    
+                    ])
+                    .split(inner);
+
+                let pct = if total > 0 { (completed * 100) / total } else { 0 };
+                let title_text = format!("{} Progress: {}% ({}/{})", message, pct, completed, total);
+                let current_p = Paragraph::new(format!("{}\nMod: {}", title_text, current_file))
+                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+                f.render_widget(current_p, chunks[0]);
+
+                let inner_width = chunks[1].width as usize - 2;
+                let filled_chars = if total > 0 { (completed * inner_width) / total } else { 0 };
+                let mut bar = String::new();
+                for _ in 0..filled_chars { bar.push('█'); }
+                for _ in filled_chars..inner_width { bar.push('░'); }
+                let bar_p = Paragraph::new(bar)
+                    .style(Style::default().fg(Color::Cyan))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
+                f.render_widget(bar_p, chunks[1]);
+
+                let log_items: Vec<ListItem> = logs.iter().rev().take(15).map(|log| {
+                    ListItem::new(log.as_str()).style(Style::default().fg(Color::Rgb(150, 150, 160)))
+                }).collect();
+
+                let log_list = List::new(log_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Mod Sync Log "));
+                f.render_widget(log_list, chunks[2]);
+            }
+
+            AppState::BackupsMenu { instance_idx, ref backups, ref backups_list_state } => {
+                let area = self.get_centered_rect(70, 70, size);
+                f.render_widget(Clear, area);
+
+                let inst = &self.instances[instance_idx];
+                let block = Block::default()
+                    .title(format!(" Backups for '{}' ", inst.config.name))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),    
+                        Constraint::Length(4), 
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = backups.iter().map(|b| {
+                    ListItem::new(format!("  {}", b)).style(Style::default().fg(Color::White))
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Created Snapshots ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = backups_list_state.clone();
+                f.render_stateful_widget(list, chunks[0], &mut state);
+
+                let help_p = Paragraph::new("Press [B] to Create New Backup\nPress [Enter] to Restore Selected Backup\nPress [Esc] to Close Menu")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+            }
+            AppState::GameRunning { .. } => {}
         }
     }
 
@@ -979,16 +1542,14 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> bool {
-        // Mode specific handling
         match self.state {
             AppState::Normal => {
-                // Main key bindings
                 match key.code {
                     KeyCode::Char('q') => return true,
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
-                            Tab::Dashboard => Tab::Versions,
-                            Tab::Versions => Tab::Accounts,
+                            Tab::Dashboard => Tab::Instances,
+                            Tab::Instances => Tab::Accounts,
                             Tab::Accounts => Tab::Settings,
                             Tab::Settings => Tab::Dashboard,
                         };
@@ -997,8 +1558,8 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Char('D') if self.active_tab == Tab::Dashboard => {
                         self.active_tab = Tab::Dashboard;
                     }
-                    KeyCode::Char('v') | KeyCode::Char('V') if self.active_tab == Tab::Dashboard => {
-                        self.active_tab = Tab::Versions;
+                    KeyCode::Char('i') | KeyCode::Char('I') if self.active_tab == Tab::Dashboard => {
+                        self.active_tab = Tab::Instances;
                     }
                     KeyCode::Char('a') | KeyCode::Char('A') if self.active_tab == Tab::Dashboard => {
                         self.active_tab = Tab::Accounts;
@@ -1006,13 +1567,9 @@ impl App {
                     KeyCode::Char('s') | KeyCode::Char('S') if self.active_tab == Tab::Dashboard => {
                         self.active_tab = Tab::Settings;
                     }
-
-                    // Launch triggers
                     KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('L') if self.active_tab == Tab::Dashboard => {
                         self.run_minecraft().await;
                     }
-
-                    // Tab specific inputs
                     _ => self.handle_tab_keys(key).await,
                 }
             }
@@ -1026,8 +1583,7 @@ impl App {
                     KeyCode::Enter => {
                         let username = self.version_search_query.trim().to_string();
                         if !username.is_empty() {
-                            // Generate offline UUID
-                            let offline_uuid = Uuid::new_v4().simple().to_string();
+                            let offline_uuid = uuid::Uuid::new_v4().simple().to_string();
                             let account = Account {
                                 uuid: offline_uuid,
                                 username,
@@ -1051,9 +1607,100 @@ impl App {
                 }
             }
 
+            AppState::CreatingInstanceName => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let id = self.version_search_query.trim().to_string();
+                        if !id.is_empty() {
+                            self.version_search_query.clear();
+                            let name = format!("{} Profile", id);
+                            if self.version_manifest.is_none() {
+                                self.fetch_manifest().await;
+                            }
+                            self.state = AppState::CreatingInstanceVersion { id, name };
+                            self.version_list_state.select(Some(0));
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::CreatingInstanceVersion { ref id, ref name } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::F(1) => {
+                        self.filter_releases = !self.filter_releases;
+                        self.filter_versions();
+                    }
+                    KeyCode::F(2) => {
+                        self.filter_snapshots = !self.filter_snapshots;
+                        self.filter_versions();
+                    }
+                    KeyCode::Up => {
+                        let selected = self.version_list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            self.version_list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down => {
+                        let selected = self.version_list_state.selected().unwrap_or(0);
+                        if selected + 1 < self.filtered_version_briefs.len() {
+                            self.version_list_state.select(Some(selected + 1));
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                        self.filter_versions();
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                        self.filter_versions();
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = self.version_list_state.selected() {
+                            if let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
+                                let id_clone = id.clone();
+                                match Instance::create(&self.config.game_dir, &id_clone, name, &brief.id) {
+                                    Ok(inst) => {
+                                        self.config.active_instance = Some(inst.id.clone());
+                                        let _ = self.config.save();
+                                        
+                                        if !self.local_versions.contains(&brief.id) {
+                                            self.start_download_flow(brief).await;
+                                        } else {
+                                            self.state = AppState::Normal;
+                                            self.status_message = Some((format!("Created instance '{}'!", id_clone), false));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.state = AppState::Normal;
+                                        self.status_message = Some((format!("Failed to create instance: {}", e), true));
+                                    }
+                                }
+                                self.refresh_instances();
+                                self.version_search_query.clear();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             AppState::AddMicrosoftAccount { .. } => {
                 if key.code == KeyCode::Esc {
-                    // Cancel MS login
                     self.state = AppState::Normal;
                     self.status_message = Some(("Cancelled Microsoft Login.".to_string(), false));
                 }
@@ -1087,9 +1734,198 @@ impl App {
                 }
             }
 
-            AppState::Downloading { .. } => {
-                // Intercept keys during downloading
+            AppState::SelectInstanceFieldToEdit { instance_idx } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                    }
+                    KeyCode::Char('1') => {
+                        let initial_val = if let Some(inst) = self.instances.get(instance_idx) {
+                            inst.config.java_path.clone().unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        self.state = AppState::EditingInstanceSetting {
+                            instance_idx,
+                            field_idx: 1,
+                            input_value: initial_val,
+                        };
+                    }
+                    KeyCode::Char('2') => {
+                        let initial_val = if let Some(inst) = self.instances.get(instance_idx) {
+                            inst.config.java_version.map(|v| v.to_string()).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        self.state = AppState::EditingInstanceSetting {
+                            instance_idx,
+                            field_idx: 2,
+                            input_value: initial_val,
+                        };
+                    }
+                    _ => {}
+                }
             }
+
+            AppState::EditingInstanceSetting { instance_idx, field_idx, ref mut input_value } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::SelectInstanceFieldToEdit { instance_idx };
+                    }
+                    KeyCode::Enter => {
+                        let val = input_value.trim().to_string();
+                        if let Some(inst) = self.instances.get_mut(instance_idx) {
+                            match field_idx {
+                                1 => {
+                                    if val.is_empty() || val == "clear" {
+                                        inst.config.java_path = None;
+                                    } else {
+                                        inst.config.java_path = Some(val);
+                                    }
+                                }
+                                2 => {
+                                    if val.is_empty() || val == "0" || val == "clear" {
+                                        inst.config.java_version = None;
+                                    } else if let Ok(ver) = val.parse::<u32>() {
+                                        inst.config.java_version = Some(ver);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            let _ = inst.save();
+                        }
+                        self.refresh_instances();
+                        self.state = AppState::Normal;
+                    }
+                    KeyCode::Char(c) => {
+                        input_value.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        input_value.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::GameRunning { ref logs, ref status, ref mut scroll_offset, ref mut auto_scroll, .. } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        if status.is_some() {
+                            self.state = AppState::Normal;
+                            self.status_message = None;
+                            self.refresh_instances();
+                        }
+                    }
+                    KeyCode::Up => {
+                        *auto_scroll = false;
+                        if *scroll_offset > 0 {
+                            *scroll_offset -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        *auto_scroll = false;
+                        if *scroll_offset + 1 < logs.len() {
+                            *scroll_offset += 1;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        *auto_scroll = false;
+                        if *scroll_offset > 15 {
+                            *scroll_offset -= 15;
+                        } else {
+                            *scroll_offset = 0;
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        *auto_scroll = false;
+                        if *scroll_offset + 15 < logs.len() {
+                            *scroll_offset += 15;
+                        } else if !logs.is_empty() {
+                            *scroll_offset = logs.len() - 1;
+                        }
+                    }
+                    KeyCode::End => {
+                        *auto_scroll = true;
+                        if !logs.is_empty() {
+                            *scroll_offset = logs.len() - 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::BackupsMenu { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::BackupsMenu { instance_idx, backups, mut backups_list_state } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // self.state is already AppState::Normal
+                        }
+                        KeyCode::Up => {
+                            let selected = backups_list_state.selected().unwrap_or(0);
+                            if selected > 0 {
+                                backups_list_state.select(Some(selected - 1));
+                            }
+                            self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                        }
+                        KeyCode::Down => {
+                            let selected = backups_list_state.selected().unwrap_or(0);
+                            if selected + 1 < backups.len() {
+                                backups_list_state.select(Some(selected + 1));
+                            }
+                            self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                        }
+                        KeyCode::Char('b') | KeyCode::Char('B') => {
+                            let inst = &self.instances[instance_idx];
+                            match inst.backup() {
+                                Ok(p) => {
+                                    self.status_message = Some((format!("Backup created: {}", p.file_name().unwrap().to_string_lossy()), false));
+                                    let new_backups = inst.list_backups();
+                                    let mut state = ListState::default();
+                                    if !new_backups.is_empty() {
+                                        state.select(Some(0));
+                                    }
+                                    self.state = AppState::BackupsMenu {
+                                        instance_idx,
+                                        backups: new_backups,
+                                        backups_list_state: state,
+                                    };
+                                }
+                                Err(e) => {
+                                    self.status_message = Some((format!("Backup failed: {}", e), true));
+                                    self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                                }
+                            }
+                        }
+                        KeyCode::Enter => {
+                            if let Some(selected_idx) = backups_list_state.selected() {
+                                if let Some(backup_name) = backups.get(selected_idx) {
+                                    let inst = &self.instances[instance_idx];
+                                    match inst.restore(backup_name) {
+                                        Ok(_) => {
+                                            self.status_message = Some((format!("Restored backup '{}' successfully!", backup_name), false));
+                                            // self.state is already Normal
+                                        }
+                                        Err(e) => {
+                                            self.status_message = Some((e, true));
+                                            self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                                        }
+                                    }
+                                } else {
+                                    self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                                }
+                            } else {
+                                self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                            }
+                        }
+                        _ => {
+                            self.state = AppState::BackupsMenu { instance_idx, backups, backups_list_state };
+                        }
+                    }
+                }
+            }
+
+            AppState::Downloading { .. } | AppState::SyncingInstanceMods { .. } => {}
         }
         false
     }
@@ -1098,54 +1934,81 @@ impl App {
         match self.active_tab {
             Tab::Dashboard => {}
             
-            Tab::Versions => {
+            Tab::Instances => {
                 match key.code {
-                    KeyCode::F(1) => {
-                        self.filter_releases = !self.filter_releases;
-                        self.filter_versions();
-                    }
-                    KeyCode::F(2) => {
-                        self.filter_snapshots = !self.filter_snapshots;
-                        self.filter_versions();
-                    }
                     KeyCode::Up => {
-                        let selected = self.version_list_state.selected().unwrap_or(0);
+                        let selected = self.instances_list_state.selected().unwrap_or(0);
                         if selected > 0 {
-                            self.version_list_state.select(Some(selected - 1));
+                            self.instances_list_state.select(Some(selected - 1));
                         }
                     }
                     KeyCode::Down => {
-                        let selected = self.version_list_state.selected().unwrap_or(0);
-                        if selected + 1 < self.filtered_version_briefs.len() {
-                            self.version_list_state.select(Some(selected + 1));
+                        let selected = self.instances_list_state.selected().unwrap_or(0);
+                        if selected + 1 < self.instances.len() {
+                            self.instances_list_state.select(Some(selected + 1));
                         }
                     }
-                    KeyCode::Char('d') | KeyCode::Char('D') => {
-                        // Force download selected version
-                        if let Some(idx) = self.version_list_state.selected() {
-                            if let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
-                                self.start_download_flow(brief).await;
+                    KeyCode::Enter => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            if let Some(inst) = self.instances.get(idx) {
+                                self.config.active_instance = Some(inst.id.clone());
+                                let _ = self.config.save();
                             }
                         }
                     }
-                    KeyCode::Char(c) => {
-                        self.version_search_query.push(c);
-                        self.filter_versions();
+                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.state = AppState::CreatingInstanceName;
+                        self.version_search_query.clear();
                     }
-                    KeyCode::Backspace => {
-                        self.version_search_query.pop();
-                        self.filter_versions();
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            self.state = AppState::SelectInstanceFieldToEdit { instance_idx: idx };
+                        }
                     }
-                    KeyCode::Enter => {
-                        // Select version as active if local, else download it!
-                        if let Some(idx) = self.version_list_state.selected() {
-                            if let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
-                                if self.local_versions.contains(&brief.id) {
-                                    self.config.selected_version = Some(brief.id);
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            if let Some(inst) = self.instances.get(idx).cloned() {
+                                let _ = inst.delete();
+                                if self.config.active_instance.as_ref() == Some(&inst.id) {
+                                    self.config.active_instance = None;
                                     let _ = self.config.save();
-                                } else {
-                                    self.start_download_flow(brief).await;
                                 }
+                                self.refresh_instances();
+                            }
+                        }
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            if let Some(inst) = self.instances.get(idx).cloned() {
+                                let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                                let game_dir = self.config.game_dir.clone();
+                                tokio::spawn(async move {
+                                    let _ = inst.sync_mods(&game_dir, tx).await;
+                                });
+                                self.state = AppState::SyncingInstanceMods {
+                                    completed: 0,
+                                    total: 100,
+                                    current_file: String::new(),
+                                    message: "Initializing mod sync...".to_string(),
+                                    logs: Vec::new(),
+                                    rx,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            if let Some(inst) = self.instances.get(idx) {
+                                let backups = inst.list_backups();
+                                let mut state = ListState::default();
+                                if !backups.is_empty() {
+                                    state.select(Some(0));
+                                }
+                                self.state = AppState::BackupsMenu {
+                                    instance_idx: idx,
+                                    backups,
+                                    backups_list_state: state,
+                                };
                             }
                         }
                     }
@@ -1168,7 +2031,6 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        // Set selected active
                         if let Some(idx) = self.account_list_state.selected() {
                             if let Some(acc) = self.config.accounts.get(idx) {
                                 self.config.active_account_uuid = Some(acc.uuid.clone());
@@ -1186,7 +2048,6 @@ impl App {
                         if let Some(idx) = self.account_list_state.selected() {
                             if let Some(acc) = self.config.accounts.get(idx).cloned() {
                                 self.config.remove_account(&acc.uuid);
-                                // Adjust selection state
                                 let len = self.config.accounts.len();
                                 if len == 0 {
                                     self.account_list_state.select(None);
@@ -1246,13 +2107,6 @@ pub async fn run_tui() -> Result<(), String> {
 
     let mut app = App::new();
     
-    // Fetch manifests in background thread
-    let version_manifest_present = app.version_manifest.is_some();
-    if !version_manifest_present {
-        app.fetch_manifest().await;
-    }
-
-    // Set default selections
     app.version_list_state.select(Some(0));
     app.account_list_state.select(Some(0));
     app.settings_list_state.select(Some(0));
@@ -1274,7 +2128,6 @@ pub async fn run_tui() -> Result<(), String> {
         }
     }
 
-    // Clean up
     disable_raw_mode().map_err(|e| format!("Failed to disable raw mode: {}", e))?;
     crossterm::execute!(
         terminal.backend_mut(),

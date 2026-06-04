@@ -74,7 +74,11 @@ impl Downloader {
     }
 
     pub async fn download_file(&self, url: &str, path: &Path, expected_sha1: &str) -> Result<(), String> {
-        if Self::verify_sha1(path, expected_sha1) {
+        if expected_sha1.is_empty() {
+            if path.exists() {
+                return Ok(());
+            }
+        } else if Self::verify_sha1(path, expected_sha1) {
             return Ok(());
         }
 
@@ -94,7 +98,7 @@ impl Downloader {
         let bytes = res.bytes().await.map_err(|e| format!("Failed to read body: {}", e))?;
         fs::write(path, &bytes).map_err(|e| format!("Failed to write file: {}", e))?;
 
-        if !Self::verify_sha1(path, expected_sha1) {
+        if !expected_sha1.is_empty() && !Self::verify_sha1(path, expected_sha1) {
             return Err(format!("SHA-1 mismatch for downloaded file: {}", path.display()));
         }
 

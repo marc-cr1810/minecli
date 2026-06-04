@@ -4,7 +4,8 @@ mod downloader;
 mod launcher;
 mod tui;
 mod java;
-
+mod instance;
+mod crash_analyzer;
 
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -14,6 +15,7 @@ use crate::config::{Config, Account, AccountType, MicrosoftAuth};
 use crate::api::ApiClient;
 use crate::downloader::{Downloader, ProgressUpdate};
 use crate::launcher::Launcher;
+use crate::instance::Instance;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,8 +33,8 @@ struct Cli {
 enum Commands {
     /// Launch Minecraft directly from the terminal
     Launch {
-        /// Minecraft version ID (e.g., 1.20.4, 1.12.2)
-        version: String,
+        /// Minecraft Instance ID to launch (uses active instance if not specified)
+        instance: Option<String>,
 
         /// Username to run with (offline or online username override)
         #[arg(short, long)]
@@ -45,6 +47,11 @@ enum Commands {
         /// Do not check or update files, launch immediately
         #[arg(long)]
         offline_mode: bool,
+    },
+    /// Manage instances (create, delete, list, backup, restore, sync)
+    Instance {
+        #[command(subcommand)]
+        action: InstanceAction,
     },
     /// List all locally downloaded versions
     List {
@@ -84,6 +91,47 @@ enum Commands {
     Settings {
         #[command(subcommand)]
         action: SettingsAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum InstanceAction {
+    /// List all local instances
+    List,
+    /// Create a new instance
+    Create {
+        id: String,
+        version: String,
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Delete an instance
+    Delete {
+        id: String,
+    },
+    /// Create a snapshot/backup of an instance
+    Backup {
+        id: String,
+    },
+    /// Restore an instance to a backup snapshot
+    Restore {
+        id: String,
+        #[arg(short, long)]
+        backup: String, // backup filename or timestamp
+    },
+    /// Synchronize/download declarative mods for an instance
+    Sync {
+        id: String,
+    },
+    /// Edit instance configuration (such as Java settings)
+    Edit {
+        id: String,
+        /// Set a custom Java executable path for this instance (use "clear" or empty to revert to default)
+        #[arg(long)]
+        java_path: Option<String>,
+        /// Set a specific JRE major version to download and use (e.g. 8, 17, 21. Use 0 to revert to auto-detection)
+        #[arg(long)]
+        java_version: Option<u32>,
     },
 }
 
@@ -134,8 +182,14 @@ async fn main() {
     let cli = Cli::parse();
     
     match cli.command {
-        Some(Commands::Launch { version, username, offline, offline_mode }) => {
-            if let Err(e) = handle_cli_launch(version, username, !offline, offline_mode).await {
+        Some(Commands::Launch { instance, username, offline, offline_mode }) => {
+            if let Err(e) = handle_cli_launch(instance, username, !offline, offline_mode).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Instance { action }) => {
+            if let Err(e) = handle_instance_command(action).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -168,14 +222,12 @@ async fn main() {
                 Ok(manifest) => {
                     let mut filtered_versions = manifest.versions;
                     
-                    // Filter by type: if either release or snapshot is set (or both)
                     if release || snapshot {
                         filtered_versions.retain(|v| {
                             (release && v.r#type == "release") || (snapshot && v.r#type == "snapshot")
                         });
                     }
                     
-                    // Filter by search query
                     if let Some(ref q) = search {
                         let q_lower = q.to_lowercase();
                         filtered_versions.retain(|v| v.id.to_lowercase().contains(&q_lower));
@@ -224,7 +276,6 @@ async fn main() {
             }
         }
         None => {
-            // Run interactive TUI
             if let Err(e) = tui::run_tui().await {
                 eprintln!("Launcher crashed: {}", e);
                 std::process::exit(1);
@@ -248,14 +299,12 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
 
     let details = api.fetch_version_details(&brief.url).await?;
 
-    // Save details locally
     if let Some(parent) = version_json_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let content = serde_json::to_string_pretty(&details).map_err(|e| e.to_string())?;
     std::fs::write(&version_json_path, content).map_err(|e| e.to_string())?;
 
-    // Download version assets & libraries
     let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
     let downloader = Downloader::new(tx);
     let game_dir = config.game_dir.clone();
@@ -264,7 +313,6 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
         let _ = downloader.download_version(&game_dir, &details).await;
     });
 
-    // Simple CLI progress indicator
     while let Some(update) = rx.recv().await {
         match update {
             ProgressUpdate::Started { total: _, message } => {
@@ -418,8 +466,128 @@ fn handle_settings_command(action: SettingsAction) -> Result<(), String> {
     Ok(())
 }
 
+async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
+    let mut config = Config::load();
+    match action {
+        InstanceAction::List => {
+            let list = Instance::load_all(&config.game_dir);
+            if list.is_empty() {
+                println!("No instances configured. Use `minecli instance create` or TUI.");
+            } else {
+                println!("Available Instances:");
+                for inst in list {
+                    let active_marker = if config.active_instance.as_ref() == Some(&inst.id) { " (ACTIVE)" } else { "" };
+                    println!(" - {} [{}] [Version: {}]{}", inst.config.name, inst.id, inst.config.version, active_marker);
+                }
+            }
+        }
+        InstanceAction::Create { id, version, name } => {
+            let name_str = name.unwrap_or_else(|| format!("{} Profile", id));
+            
+            let api = ApiClient::new();
+            println!("Validating Minecraft version '{}'...", version);
+            let manifest = api.fetch_version_manifest().await?;
+            if !manifest.versions.iter().any(|v| v.id == version) {
+                return Err(format!("Version '{}' not found in Mojang version manifest.", version));
+            }
+
+            let inst = Instance::create(&config.game_dir, &id, &name_str, &version)?;
+            config.active_instance = Some(inst.id.clone());
+            config.save()?;
+            
+            println!("Created instance '{}' ({} - {}) and set it as active.", id, name_str, version);
+            println!("Run `minecli launch {}` to play.", id);
+        }
+        InstanceAction::Delete { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            inst.delete()?;
+            if config.active_instance.as_ref() == Some(&id) {
+                config.active_instance = None;
+                config.save()?;
+            }
+            println!("Deleted instance '{}'.", id);
+        }
+        InstanceAction::Backup { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            println!("Creating backup of instance '{}'...", id);
+            let path = inst.backup()?;
+            println!("Backup created at: {}", path.display());
+        }
+        InstanceAction::Restore { id, backup } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            println!("Restoring backup '{}' for instance '{}'...", backup, id);
+            inst.restore(&backup)?;
+            println!("Instance restored successfully!");
+        }
+        InstanceAction::Sync { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            println!("Syncing mods for instance '{}'...", id);
+            let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
+            let game_dir = config.game_dir.clone();
+            tokio::spawn(async move {
+                let _ = inst.sync_mods(&game_dir, tx).await;
+            });
+            while let Some(update) = rx.recv().await {
+                match update {
+                    ProgressUpdate::Started { total, message } => {
+                        println!("Sync started: {} (Total: {})", message, total);
+                    }
+                    ProgressUpdate::Progress { completed, total, current_file } => {
+                        print!("\r[{}/{}] Syncing: {}                             ", completed, total, current_file);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        println!("\n{}", msg);
+                    }
+                    ProgressUpdate::Finished => {
+                        println!("\nMod sync completed successfully!");
+                    }
+                    ProgressUpdate::Error(e) => {
+                        return Err(format!("Mod sync failed: {}", e));
+                    }
+                }
+            }
+        }
+        InstanceAction::Edit { id, java_path, java_version } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let mut modified = false;
+
+            if let Some(path) = java_path {
+                if path.is_empty() || path == "clear" {
+                    inst.config.java_path = None;
+                    println!("Cleared custom Java path for instance '{}'.", id);
+                } else {
+                    inst.config.java_path = Some(path);
+                    println!("Set custom Java path for instance '{}' to: {}", id, inst.config.java_path.as_ref().unwrap());
+                }
+                modified = true;
+            }
+
+            if let Some(ver) = java_version {
+                if ver == 0 {
+                    inst.config.java_version = None;
+                    println!("Cleared custom JRE version for instance '{}'.", id);
+                } else {
+                    inst.config.java_version = Some(ver);
+                    println!("Set custom JRE version for instance '{}' to: Java {}", id, ver);
+                }
+                modified = true;
+            }
+
+            if modified {
+                inst.save()?;
+                println!("Saved settings for instance '{}'.", id);
+            } else {
+                println!("No changes specified. Use `--java-path` or `--java-version`.");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_cli_launch(
-    version_id: String,
+    instance_id: Option<String>,
     username_override: Option<String>,
     force_online: bool,
     skip_downloads: bool,
@@ -427,14 +595,15 @@ async fn handle_cli_launch(
     let mut config = Config::load();
     let api = ApiClient::new();
 
-    // 1. Resolve Account
+    let inst_id = instance_id.or(config.active_instance.clone()).ok_or("No instance selected and no active instance set. Use 'minecli instance create' or select one in the TUI.")?;
+    let instance = Instance::load(&inst_id, config.game_dir.join("instances").join(&inst_id))?;
+    let version_id = instance.config.version.clone();
+
     let account = if !force_online {
-        // Resolve Offline Account
         let username = username_override
             .or_else(|| config.get_active_account().map(|a| a.username.clone()))
             .unwrap_or_else(|| "Player".to_string());
 
-        // Find existing offline account
         let mut resolved_acc = None;
         for acc in &config.accounts {
             if acc.username == username && acc.account_type == AccountType::Offline {
@@ -458,7 +627,6 @@ async fn handle_cli_launch(
             }
         }
     } else {
-        // Resolve Online / Active Account (default behavior)
         let mut target_account = None;
         if let Some(ref acc) = config.get_active_account() {
             if acc.account_type == AccountType::Microsoft {
@@ -479,7 +647,6 @@ async fn handle_cli_launch(
         match target_account {
             Some(mut acc) => {
                 if acc.account_type == AccountType::Microsoft {
-                    // Check if token is expired, refresh if needed
                     if let Some(ref auth) = acc.microsoft_auth {
                         let is_expired = auth.expires_at.map(|exp| exp < chrono::Utc::now()).unwrap_or(true);
                         if is_expired {
@@ -510,13 +677,11 @@ async fn handle_cli_launch(
                     println!("Logged in online as: {}", acc.username);
                     acc
                 } else {
-                    // Active account is offline
                     println!("Logged in offline as: {}", acc.username);
                     acc
                 }
             }
             None => {
-                // No accounts at all, start Microsoft Online Device Code login flow
                 println!("No account configured. Starting Microsoft Online Login...");
                 let dev_code = api.request_device_code().await?;
                 println!("To log in, open a web browser and navigate to:");
@@ -571,7 +736,6 @@ async fn handle_cli_launch(
         }
     };
 
-    // 2. Download Game Files if needed
     let version_json_path = config.game_dir
         .join("versions")
         .join(&version_id)
@@ -581,10 +745,9 @@ async fn handle_cli_launch(
         download_version_files(&config, &version_id).await?;
     }
 
-    // 3. Launch Minecraft
     println!("Preparing launch parameters...");
     let launcher = Launcher::new(config);
-    launcher.launch(&version_id, &account).await?;
+    launcher.launch(&instance, &account).await?;
 
     Ok(())
 }

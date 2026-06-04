@@ -96,7 +96,13 @@ impl Launcher {
         result
     }
 
-    pub async fn prepare_launch(&self, version_id: &str, account: &Account) -> Result<Command, String> {
+    pub async fn prepare_launch(
+        &self,
+        instance: &crate::instance::Instance,
+        account: &Account,
+        log_tx: &Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<Command, String> {
+        let version_id = &instance.config.version;
         let details = self.load_version_details(version_id)?;
 
         let classpath = self.build_classpath(&details)?;
@@ -107,7 +113,7 @@ impl Launcher {
         let mut vars = HashMap::new();
         vars.insert("auth_player_name", account.username.clone());
         vars.insert("version_name", version_id.to_string());
-        vars.insert("game_directory", self.config.game_dir.to_string_lossy().to_string());
+        vars.insert("game_directory", instance.path.to_string_lossy().to_string());
         vars.insert("assets_root", self.config.game_dir.join("assets").to_string_lossy().to_string());
         vars.insert("assets_index_name", details.assetIndex.id.clone());
         vars.insert("auth_uuid", format_uuid_with_hyphens(&account.uuid));
@@ -190,7 +196,8 @@ impl Launcher {
         }
 
         // Add config/user JVM arguments (like -Xmx2G)
-        for arg in &self.config.jvm_args {
+        let custom_jvm = instance.config.jvm_args.as_ref().unwrap_or(&self.config.jvm_args);
+        for arg in custom_jvm {
             jvm_args.push(arg.clone());
         }
 
@@ -244,19 +251,55 @@ impl Launcher {
             }
         }
 
-        // 3. Construct command
-        let java_exe = if self.config.java_path == std::path::Path::new("java") || !self.config.java_path.exists() {
-            let java_version = details.javaVersion.as_ref().map(|jv| jv.majorVersion).unwrap_or(17);
-            crate::java::install_java_if_needed(&self.config.game_dir, java_version).await?
-        } else {
-            std::path::PathBuf::from(&self.config.java_path)
+        let log_info = |msg: String| {
+            if let Some(ref tx) = *log_tx {
+                let _ = tx.try_send(msg);
+            } else {
+                println!("{}", msg);
+            }
         };
 
+        // 3. Construct command
+        let java_version;
+        let java_exe = if let Some(ref inst_java_path_str) = instance.config.java_path {
+            let path = std::path::PathBuf::from(inst_java_path_str);
+            if path.exists() {
+                log_info(format!("Using instance custom Java path: {}", inst_java_path_str));
+                java_version = instance.config.java_version.unwrap_or(21);
+                path
+            } else {
+                return Err(format!("Custom instance Java path does not exist: {}", inst_java_path_str));
+            }
+        } else if self.config.java_path != std::path::Path::new("java") && self.config.java_path.exists() {
+            log_info(format!("Using global custom Java path: {}", self.config.java_path.display()));
+            java_version = instance.config.java_version.unwrap_or(21);
+            std::path::PathBuf::from(&self.config.java_path)
+        } else {
+            let jv = instance.config.java_version
+                .or_else(|| details.javaVersion.as_ref().map(|jv| jv.majorVersion))
+                .unwrap_or(17);
+            java_version = jv;
+            let log_tx_clone = log_tx.clone();
+            crate::java::install_java_if_needed(&self.config.game_dir, jv, move |msg| {
+                if let Some(ref tx) = log_tx_clone {
+                    let _ = tx.try_send(msg);
+                } else {
+                    println!("{}", msg);
+                }
+            }).await?
+        };
+
+        // Filter out incompatible JVM arguments for Java versions < 22
+        let mut final_jvm_args = jvm_args.clone();
+        if java_version < 22 {
+            final_jvm_args.retain(|arg| arg != "--sun-misc-unsafe-memory-access=allow");
+        }
+
         let mut cmd = Command::new(java_exe);
-        cmd.current_dir(&self.config.game_dir);
+        cmd.current_dir(&instance.path);
         
         // Pass JVM args
-        cmd.args(&jvm_args);
+        cmd.args(&final_jvm_args);
         
         // Main Class
         cmd.arg(&details.mainClass);
@@ -267,26 +310,137 @@ impl Launcher {
         Ok(cmd)
     }
 
-    pub async fn launch(&self, version_id: &str, account: &Account) -> Result<(), String> {
-        let mut cmd = self.prepare_launch(version_id, account).await?;
-        
-        // Redirect stdout/stderr to parent process so standard terminal logging works
-        cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
+    pub async fn launch(&self, instance: &crate::instance::Instance, account: &Account) -> Result<(), String> {
+        self.launch_with_logs(instance, account, None).await
+    }
 
-        println!("Launch command: {:?}", cmd);
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to spawn Java process: {}. Is Java installed and configured correctly?", e))?;
+    pub async fn launch_with_logs(
+        &self, 
+        instance: &crate::instance::Instance, 
+        account: &Account,
+        log_tx: Option<tokio::sync::mpsc::Sender<String>>
+    ) -> Result<(), String> {
+        let interpolate = |cmd_str: &str| -> String {
+            cmd_str
+                .replace("${game_directory}", &instance.path.to_string_lossy())
+                .replace("${version_id}", &instance.config.version)
+        };
+
+        let log_info = |msg: String| {
+            if let Some(ref tx) = log_tx {
+                let _ = tx.try_send(msg);
+            } else {
+                println!("{}", msg);
+            }
+        };
+
+        // Run pre-launch hook if present
+        if let Some(ref pre_cmd) = instance.config.pre_launch {
+            if !pre_cmd.trim().is_empty() {
+                let interpolated = interpolate(pre_cmd);
+                log_info(format!("Running pre-launch hook: {}", interpolated));
+                let status = run_hook_command(&interpolated, &instance.path)?;
+                if !status.success() {
+                    return Err(format!("Pre-launch hook exited with failure code: {:?}", status.code()));
+                }
+            }
+        }
+
+        let mut cmd = self.prepare_launch(instance, account, &log_tx).await?;
         
-        let status = child.wait()
-            .map_err(|e| format!("Minecraft game process error: {}", e))?;
+        let status = if let Some(tx) = log_tx.clone() {
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+
+            log_info(format!("Launch command: {:?}", cmd));
+            let mut child = cmd.spawn()
+                .map_err(|e| format!("Failed to spawn Java process: {}. Is Java installed and configured correctly?", e))?;
+
+            let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
+            let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
+
+            use std::io::{BufRead, BufReader};
+            let tx_out = tx.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let _ = tx_out.blocking_send(line);
+                }
+            });
+
+            let tx_err = tx.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let _ = tx_err.blocking_send(line);
+                }
+            });
+
+            child.wait()
+                .map_err(|e| format!("Minecraft game process error: {}", e))?
+        } else {
+            // Redirect stdout/stderr to parent process so standard terminal logging works
+            cmd.stdout(Stdio::inherit());
+            cmd.stderr(Stdio::inherit());
+
+            println!("Launch command: {:?}", cmd);
+            let mut child = cmd.spawn()
+                .map_err(|e| format!("Failed to spawn Java process: {}. Is Java installed and configured correctly?", e))?;
+            
+            child.wait()
+                .map_err(|e| format!("Minecraft game process error: {}", e))?
+        };
+
+        // Run post-exit hook if present
+        if let Some(ref post_cmd) = instance.config.post_exit {
+            if !post_cmd.trim().is_empty() {
+                let interpolated = interpolate(post_cmd);
+                log_info(format!("Running post-exit hook: {}", interpolated));
+                if let Err(e) = run_hook_command(&interpolated, &instance.path) {
+                    log_info(format!("Warning: post-exit hook failed: {}", e));
+                }
+            }
+        }
 
         if !status.success() {
+            if log_tx.is_none() {
+                // Read latest.log
+                let log_path = instance.path.join("logs").join("latest.log");
+                if let Ok(content) = std::fs::read_to_string(&log_path) {
+                    if let Some(analysis) = crate::crash_analyzer::analyze_crash(&instance.path, &content) {
+                        println!("\n==================================================");
+                        println!("[!] CRASH DIAGNOSTICS DETECTED:");
+                        println!("Title: {}", analysis.title);
+                        println!("Cause: {}", analysis.description);
+                        println!("Solutions:");
+                        for sol in &analysis.possible_solutions {
+                            println!("  - {}", sol);
+                        }
+                        println!("==================================================\n");
+                    }
+                }
+            }
             return Err(format!("Minecraft exited with non-zero code: {:?}", status.code()));
         }
 
         Ok(())
     }
+}
+
+fn run_hook_command(command_str: &str, cwd: &std::path::Path) -> Result<std::process::ExitStatus, String> {
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/C").arg(command_str);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command_str);
+        c
+    };
+    cmd.current_dir(cwd);
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    cmd.status().map_err(|e| format!("Failed to run hook command: {}", e))
 }
 
 fn format_uuid_with_hyphens(uuid: &str) -> String {

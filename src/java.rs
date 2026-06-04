@@ -5,10 +5,14 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 use zip::ZipArchive;
 
-pub async fn install_java_if_needed<P: AsRef<Path>>(
+pub async fn install_java_if_needed<P: AsRef<Path>, F>(
     game_dir: P,
     major_version: u32,
-) -> Result<PathBuf, String> {
+    mut log_fn: F,
+) -> Result<PathBuf, String> 
+where
+    F: FnMut(String),
+{
     let game_dir = game_dir.as_ref();
     let runtime_dir = game_dir.join("runtime").join(format!("java-{}", major_version));
     
@@ -28,7 +32,7 @@ pub async fn install_java_if_needed<P: AsRef<Path>>(
         }
     }
 
-    println!("Installing Java {} (Adoptium JRE)... This may take a minute.", major_version);
+    log_fn(format!("Installing Java {} (Adoptium JRE)... This may take a minute.", major_version));
     fs::create_dir_all(&runtime_dir).map_err(|e| format!("Failed to create runtime dir: {}", e))?;
 
     // Map current platform to Adoptium API parameters
@@ -96,7 +100,7 @@ pub async fn install_java_if_needed<P: AsRef<Path>>(
                 let _ = fs::set_permissions(&exe_path, perms);
             }
         }
-        println!("Java {} installed successfully to: {}", major_version, exe_path.display());
+        log_fn(format!("Java {} installed successfully to: {}", major_version, exe_path.display()));
         Ok(exe_path)
     } else {
         Err("Failed to find java executable after extraction".to_string())
