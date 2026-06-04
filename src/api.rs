@@ -72,8 +72,8 @@ impl Rule {
                     return false;
                 }
             }
-            if let Some(arch_opt) = &os_rule.arch {
-                if let Some(arch) = arch_opt {
+            if let Some(arch_opt) = &os_rule.arch
+                && let Some(arch) = arch_opt {
                     let current_arch = if cfg!(target_arch = "x86") {
                         "x86"
                     } else if cfg!(target_arch = "x86_64") {
@@ -85,19 +85,16 @@ impl Rule {
                         return false;
                     }
                 }
-            }
         }
         if let Some(ref features_rule) = self.features {
-            if let Some(is_demo) = features_rule.is_demo_user {
-                if is_demo {
+            if let Some(is_demo) = features_rule.is_demo_user
+                && is_demo {
                     return false;
                 }
-            }
-            if let Some(has_custom_res) = features_rule.has_custom_resolution {
-                if !has_custom_res {
+            if let Some(has_custom_res) = features_rule.has_custom_resolution
+                && !has_custom_res {
                     return false;
                 }
-            }
         }
         true
     }
@@ -202,11 +199,10 @@ pub struct Library {
 
 impl Library {
     pub fn get_artifact(&self) -> Option<Artifact> {
-        if let Some(ref downloads) = self.downloads {
-            if let Some(ref art) = downloads.artifact {
+        if let Some(ref downloads) = self.downloads
+            && let Some(ref art) = downloads.artifact {
                 return Some(art.clone());
             }
-        }
 
         if let Some(path) = maven_to_path(&self.name) {
             let sha1 = self.sha1.clone().unwrap_or_default();

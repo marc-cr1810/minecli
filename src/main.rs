@@ -349,30 +349,28 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
     let details = if version_json_path.exists() {
         let launcher = Launcher::new(config.clone());
         launcher.load_version_details_raw(version_id)?
+    } else if version_id.starts_with("fabric-loader-") {
+        let rest = version_id.strip_prefix("fabric-loader-").unwrap();
+        let (loader_ver, game_ver) = rest.split_once('-')
+            .ok_or_else(|| format!("Invalid Fabric version ID format: {}", version_id))?;
+        println!("{} (Loader: {}, Game: {})...", "Fetching Fabric profile".cyan(), loader_ver.yellow(), game_ver.yellow());
+        api.fetch_fabric_profile(game_ver, loader_ver).await?
+    } else if version_id.starts_with("forge-") {
+        let loader_ver = version_id.strip_prefix("forge-").unwrap();
+        println!("{} (Version: {})...", "Fetching Forge profile".cyan(), loader_ver.yellow());
+        api.fetch_forge_profile(loader_ver).await?
+    } else if version_id.starts_with("neoforge-") {
+        let loader_ver = version_id.strip_prefix("neoforge-").unwrap();
+        println!("{} (Version: {})...", "Fetching NeoForge profile".cyan(), loader_ver.yellow());
+        api.fetch_neoforge_profile(loader_ver).await?
     } else {
-        if version_id.starts_with("fabric-loader-") {
-            let rest = version_id.strip_prefix("fabric-loader-").unwrap();
-            let (loader_ver, game_ver) = rest.split_once('-')
-                .ok_or_else(|| format!("Invalid Fabric version ID format: {}", version_id))?;
-            println!("{} (Loader: {}, Game: {})...", "Fetching Fabric profile".cyan(), loader_ver.yellow(), game_ver.yellow());
-            api.fetch_fabric_profile(game_ver, loader_ver).await?
-        } else if version_id.starts_with("forge-") {
-            let loader_ver = version_id.strip_prefix("forge-").unwrap();
-            println!("{} (Version: {})...", "Fetching Forge profile".cyan(), loader_ver.yellow());
-            api.fetch_forge_profile(loader_ver).await?
-        } else if version_id.starts_with("neoforge-") {
-            let loader_ver = version_id.strip_prefix("neoforge-").unwrap();
-            println!("{} (Version: {})...", "Fetching NeoForge profile".cyan(), loader_ver.yellow());
-            api.fetch_neoforge_profile(loader_ver).await?
-        } else {
-            println!("{} {}...", "Fetching details for Minecraft version".cyan(), version_id.yellow());
-            let manifest = api.fetch_version_manifest().await?;
-            let brief = manifest.versions.iter()
-                .find(|v| v.id == version_id)
-                .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang manifest.", version_id))?;
+        println!("{} {}...", "Fetching details for Minecraft version".cyan(), version_id.yellow());
+        let manifest = api.fetch_version_manifest().await?;
+        let brief = manifest.versions.iter()
+            .find(|v| v.id == version_id)
+            .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang manifest.", version_id))?;
 
-            api.fetch_version_details(&brief.url).await?
-        }
+        api.fetch_version_details(&brief.url).await?
     };
 
     if !version_json_path.exists() {
@@ -944,21 +942,18 @@ async fn handle_cli_launch(
         }
     } else {
         let mut target_account = None;
-        if let Some(ref acc) = config.get_active_account() {
-            if acc.account_type == AccountType::Microsoft {
-                target_account = Some((*acc).clone());
+        if let Some(acc) = config.get_active_account()
+            && acc.account_type == AccountType::Microsoft {
+                target_account = Some(acc.clone());
             }
-        }
         if target_account.is_none() {
             target_account = config.accounts.iter().find(|a| a.account_type == AccountType::Microsoft).cloned();
         }
-        if target_account.is_none() {
-            if let Some(ref acc) = config.get_active_account() {
-                if acc.account_type == AccountType::Offline {
-                    target_account = Some((*acc).clone());
+        if target_account.is_none()
+            && let Some(acc) = config.get_active_account()
+                && acc.account_type == AccountType::Offline {
+                    target_account = Some(acc.clone());
                 }
-            }
-        }
 
         match target_account {
             Some(mut acc) => {

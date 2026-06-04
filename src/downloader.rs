@@ -174,14 +174,12 @@ impl Downloader {
                 }
             }
 
-            if parent_json_path.exists() {
-                if let Ok(parent_content) = fs::read_to_string(&parent_json_path) {
-                    if let Ok(parent_details) = serde_json::from_str::<VersionDetails>(&parent_content) {
+            if parent_json_path.exists()
+                && let Ok(parent_content) = fs::read_to_string(&parent_json_path)
+                    && let Ok(parent_details) = serde_json::from_str::<VersionDetails>(&parent_content) {
                         self.send_message(format!("Parent profile detected ({}). Ensuring parent is downloaded...", parent_id)).await;
                         Box::pin(self.download_version(game_dir, &parent_details)).await?;
                     }
-                }
-            }
         }
 
         // 1. Download Client JAR
@@ -209,27 +207,22 @@ impl Downloader {
         };
 
         for lib in &version_details.libraries {
-            if let Some(ref rules) = lib.rules {
-                if !Rule::evaluate(rules) {
+            if let Some(ref rules) = lib.rules
+                && !Rule::evaluate(rules) {
                     continue;
                 }
-            }
 
             if let Some(art) = lib.get_artifact() {
                 libs_to_download.push((art, false));
             }
 
-            if let Some(ref natives_map) = lib.natives {
-                if let Some(classifier) = natives_map.get(current_os) {
-                    if let Some(ref downloads) = lib.downloads {
-                        if let Some(ref classifiers) = downloads.classifiers {
-                            if let Some(art) = classifiers.get(classifier) {
+            if let Some(ref natives_map) = lib.natives
+                && let Some(classifier) = natives_map.get(current_os)
+                    && let Some(ref downloads) = lib.downloads
+                        && let Some(ref classifiers) = downloads.classifiers
+                            && let Some(art) = classifiers.get(classifier) {
                                 libs_to_download.push((art.clone(), true));
                             }
-                        }
-                    }
-                }
-            }
         }
 
         let total_libs = libs_to_download.len();
@@ -304,34 +297,26 @@ impl Downloader {
                         };
 
                         if result.is_ok() {
-                            match client.get(&url).send().await {
-                                Ok(res) => {
-                                    if res.status().is_success() {
-                                        match res.bytes().await {
-                                            Ok(bytes) => {
-                                                if fs::write(&path, &bytes).is_ok() {
-                                                    let verified = Self::verify_sha1(&path, &sha1);
-                                                    if verified {
-                                                        let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                                        let filename = Path::new(&name).file_name()
-                                                            .and_then(|f| f.to_str())
-                                                            .unwrap_or("asset")
-                                                            .to_string();
+                            if let Ok(res) = client.get(&url).send().await {
+                                if res.status().is_success()
+                                    && let Ok(bytes) = res.bytes().await
+                                        && fs::write(&path, &bytes).is_ok() {
+                                            let verified = Self::verify_sha1(&path, &sha1);
+                                            if verified {
+                                                let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                                let filename = Path::new(&name).file_name()
+                                                    .and_then(|f| f.to_str())
+                                                    .unwrap_or("asset")
+                                                    .to_string();
 
-                                                        let _ = progress_tx.send(ProgressUpdate::Progress {
-                                                            completed: count,
-                                                            total: total_assets,
-                                                            current_file: filename,
-                                                        }).await;
-                                                        return Ok(());
-                                                    }
-                                                }
+                                                let _ = progress_tx.send(ProgressUpdate::Progress {
+                                                    completed: count,
+                                                    total: total_assets,
+                                                    current_file: filename,
+                                                }).await;
+                                                return Ok(());
                                             }
-                                            _ => {}
                                         }
-                                    }
-                                }
-                                _ => {}
                             }
                         }
                         Err(format!("Failed to download asset: {}", name))

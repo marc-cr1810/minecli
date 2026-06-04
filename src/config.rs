@@ -69,11 +69,7 @@ impl Config {
         let mut config = if let Some(path) = Self::config_path() {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
-                        cfg
-                    } else {
-                        Config::default()
-                    }
+                    serde_json::from_str::<Config>(&content).unwrap_or_default()
                 } else {
                     Config::default()
                 }

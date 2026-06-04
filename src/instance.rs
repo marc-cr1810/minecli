@@ -340,7 +340,7 @@ impl Instance {
                 if target_path.exists() {
                     let _ = fs::remove_file(&target_path);
                 }
-                if let Err(_) = fs::hard_link(&cache_path, &target_path) {
+                if fs::hard_link(&cache_path, &target_path).is_err() {
                     fs::copy(&cache_path, &target_path)
                         .map_err(|e| format!("Failed to copy mod to instance mods: {}", e))?;
                 }
@@ -356,14 +356,13 @@ impl Instance {
         // Cleanup: remove jars that are not declared
         if let Ok(entries) = fs::read_dir(&mods_dir) {
             for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    if file_type.is_file() {
+                if let Ok(file_type) = entry.file_type()
+                    && file_type.is_file() {
                         let filename = entry.file_name().to_string_lossy().to_string();
                         if filename.ends_with(".jar") && !expected_filenames.contains(&filename) {
                             let _ = fs::remove_file(entry.path());
                         }
                     }
-                }
             }
         }
 
@@ -400,8 +399,8 @@ impl Instance {
         let mut list = Vec::new();
         if let Ok(entries) = fs::read_dir(mods_dir) {
             for entry in entries.flatten() {
-                if let Ok(file_type) = entry.file_type() {
-                    if file_type.is_file() {
+                if let Ok(file_type) = entry.file_type()
+                    && file_type.is_file() {
                         let filename = entry.file_name().to_string_lossy().to_string();
                         let enabled = !filename.ends_with(".disabled");
                         if filename.ends_with(".jar") || filename.ends_with(".jar.disabled") {
@@ -421,7 +420,6 @@ impl Instance {
                             });
                         }
                     }
-                }
             }
         }
         list.sort_by(|a, b| a.metadata.name.to_lowercase().cmp(&b.metadata.name.to_lowercase()));
@@ -495,8 +493,8 @@ impl Instance {
 
         // 2. Add overrides/mods/
         let mods_dir = self.path.join("mods");
-        if mods_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&mods_dir) {
+        if mods_dir.exists()
+            && let Ok(entries) = fs::read_dir(&mods_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
@@ -512,7 +510,6 @@ impl Instance {
                     }
                 }
             }
-        }
 
         // 3. Add overrides/config/
         let config_dir = self.path.join("config");
@@ -664,32 +661,27 @@ impl Instance {
                     break;
                 }
 
-                if let Ok(res) = client.get(url).send().await {
-                    if res.status().is_success() {
-                        if let Ok(bytes) = res.bytes().await {
-                            if fs::write(&dest_path, &bytes).is_ok() {
-                                if crate::downloader::Downloader::verify_sha1(&dest_path, &pack_file.hashes.sha1) {
+                if let Ok(res) = client.get(url).send().await
+                    && res.status().is_success()
+                        && let Ok(bytes) = res.bytes().await
+                            && fs::write(&dest_path, &bytes).is_ok()
+                                && crate::downloader::Downloader::verify_sha1(&dest_path, &pack_file.hashes.sha1) {
                                     downloaded = true;
                                     break;
                                 }
-                            }
-                        }
-                    }
-                }
             }
 
             if !downloaded {
                 return Err(format!("Failed to download file: {}", pack_file.path));
             }
 
-            if pack_file.path.starts_with("mods/") {
-                if let Some(first_url) = pack_file.downloads.first() {
+            if pack_file.path.starts_with("mods/")
+                && let Some(first_url) = pack_file.downloads.first() {
                     instance_mods.insert(filename, ModValue::Detailed {
                         url: first_url.clone(),
                         sha1: Some(pack_file.hashes.sha1.clone()),
                     });
                 }
-            }
         }
 
         // Create the instance configuration
@@ -722,8 +714,8 @@ pub fn read_mod_metadata(jar_path: &Path) -> Result<ModMetadata, String> {
     // Try fabric.mod.json
     if let Ok(mut fabric_file) = archive.by_name("fabric.mod.json") {
         let mut content = String::new();
-        if fabric_file.read_to_string(&mut content).is_ok() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if fabric_file.read_to_string(&mut content).is_ok()
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 let id = json["id"].as_str().unwrap_or("").to_string();
                 let name = json["name"].as_str().map(|s| s.to_string()).unwrap_or_else(|| id.clone());
                 let version = json["version"].as_str().unwrap_or("unknown").to_string();
@@ -732,17 +724,16 @@ pub fn read_mod_metadata(jar_path: &Path) -> Result<ModMetadata, String> {
                     return Ok(ModMetadata { id, name, version, description });
                 }
             }
-        }
     }
 
     // Try mods.toml or neoforge.mods.toml under META-INF
     for name in &["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
         if let Ok(mut toml_file) = archive.by_name(name) {
             let mut content = String::new();
-            if toml_file.read_to_string(&mut content).is_ok() {
-                if let Ok(toml_val) = toml::from_str::<toml::Value>(&content) {
-                    if let Some(mods_array) = toml_val.get("mods").and_then(|m| m.as_array()) {
-                        if let Some(first_mod) = mods_array.get(0) {
+            if toml_file.read_to_string(&mut content).is_ok()
+                && let Ok(toml_val) = toml::from_str::<toml::Value>(&content)
+                    && let Some(mods_array) = toml_val.get("mods").and_then(|m| m.as_array())
+                        && let Some(first_mod) = mods_array.first() {
                             let id = first_mod.get("modId").and_then(|v| v.as_str())
                                 .or_else(|| first_mod.get("id").and_then(|v| v.as_str()))
                                 .unwrap_or("")
@@ -760,9 +751,6 @@ pub fn read_mod_metadata(jar_path: &Path) -> Result<ModMetadata, String> {
                                 return Ok(ModMetadata { id, name, version, description });
                             }
                         }
-                    }
-                }
-            }
         }
     }
 
@@ -820,11 +808,10 @@ fn unzip_to_dir(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         if (*file.name()).ends_with('/') {
             fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
         } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
+            if let Some(p) = outpath.parent()
+                && !p.exists() {
                     fs::create_dir_all(p).map_err(|e| e.to_string())?;
                 }
-            }
             let mut outfile = File::create(&outpath).map_err(|e| e.to_string())?;
             io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
         }

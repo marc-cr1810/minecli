@@ -154,11 +154,10 @@ impl Launcher {
         let libraries_dir = self.config.game_dir.join("libraries");
 
         for lib in &details.libraries {
-            if let Some(ref rules) = lib.rules {
-                if !Rule::evaluate(rules) {
+            if let Some(ref rules) = lib.rules
+                && !Rule::evaluate(rules) {
                     continue;
                 }
-            }
 
             if let Some(art) = lib.get_artifact() {
                 let lib_path = libraries_dir.join(&art.path);
@@ -432,8 +431,8 @@ impl Launcher {
         };
 
         // Run pre-launch hook if present
-        if let Some(ref pre_cmd) = instance.config.pre_launch {
-            if !pre_cmd.trim().is_empty() {
+        if let Some(ref pre_cmd) = instance.config.pre_launch
+            && !pre_cmd.trim().is_empty() {
                 let interpolated = interpolate(pre_cmd);
                 log_info(format!("Running pre-launch hook: {}", interpolated));
                 let status = run_hook_command(&interpolated, &instance.path)?;
@@ -441,7 +440,6 @@ impl Launcher {
                     return Err(format!("Pre-launch hook exited with failure code: {:?}", status.code()));
                 }
             }
-        }
 
         let mut cmd = self.prepare_launch(instance, account, &log_tx).await?;
         
@@ -489,8 +487,8 @@ impl Launcher {
         };
 
         // Run post-exit hook if present
-        if let Some(ref post_cmd) = instance.config.post_exit {
-            if !post_cmd.trim().is_empty() {
+        if let Some(ref post_cmd) = instance.config.post_exit
+            && !post_cmd.trim().is_empty() {
                 let interpolated = interpolate(post_cmd);
                 log_info(format!("Running post-exit hook: {}", interpolated));
                 if let Err(e) = run_hook_command(&interpolated, &instance.path) {
@@ -501,14 +499,13 @@ impl Launcher {
                     }
                 }
             }
-        }
 
         if !status.success() {
             if log_tx.is_none() {
                 // Read latest.log
                 let log_path = instance.path.join("logs").join("latest.log");
-                if let Ok(content) = std::fs::read_to_string(&log_path) {
-                    if let Some(analysis) = crate::crash_analyzer::analyze_crash(&instance.path, &content) {
+                if let Ok(content) = std::fs::read_to_string(&log_path)
+                    && let Some(analysis) = crate::crash_analyzer::analyze_crash(&instance.path, &content) {
                         println!("\n{}", "==================================================".red());
                         println!("{} {}", "[!]".red().bold(), "CRASH DIAGNOSTICS DETECTED:".red().bold());
                         println!("{}: {}", "Title".bold(), analysis.title.red());
@@ -519,7 +516,6 @@ impl Launcher {
                         }
                         println!("{}\n", "==================================================".red());
                     }
-                }
             }
             return Err(format!("Minecraft exited with non-zero code: {:?}", status.code()));
         }
@@ -566,7 +562,7 @@ fn extract_xuid_from_token(token: &str) -> Option<String> {
         let payload_b64 = parts[1];
         // Decode base64url manually
         let mut s = payload_b64.replace('-', "+").replace('_', "/");
-        while s.len() % 4 != 0 {
+        while !s.len().is_multiple_of(4) {
             s.push('=');
         }
         
@@ -577,7 +573,7 @@ fn extract_xuid_from_token(token: &str) -> Option<String> {
         
         let bytes = s.as_bytes();
         let len = bytes.len();
-        if len % 4 == 0 {
+        if len.is_multiple_of(4) {
             let mut out = Vec::new();
             let mut i = 0;
             while i < len {
@@ -597,13 +593,11 @@ fn extract_xuid_from_token(token: &str) -> Option<String> {
                 }
                 i += 4;
             }
-            if let Ok(json_str) = String::from_utf8(out) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if let Some(xuid) = val.get("xuid") {
+            if let Ok(json_str) = String::from_utf8(out)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str)
+                    && let Some(xuid) = val.get("xuid") {
                         return xuid.as_str().map(|s| s.to_string());
                     }
-                }
-            }
         }
     }
     None

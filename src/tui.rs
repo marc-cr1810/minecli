@@ -529,11 +529,10 @@ impl App {
 
         // 3c. Process Modrinth search results
         let mut search_finished_state = None;
-        if let AppState::SearchingModpackLoading { ref query, ref mut rx } = self.state {
-            if let Ok(res) = rx.try_recv() {
+        if let AppState::SearchingModpackLoading { ref query, ref mut rx } = self.state
+            && let Ok(res) = rx.try_recv() {
                 search_finished_state = Some((query.clone(), res));
             }
-        }
         if let Some((query, res)) = search_finished_state {
             match res {
                 Ok(hits) => {
@@ -552,11 +551,10 @@ impl App {
 
         // 3d. Process Modrinth version results
         let mut versions_finished_state = None;
-        if let AppState::SearchingModpackVersionsLoading { ref hit, ref mut rx } = self.state {
-            if let Ok(res) = rx.try_recv() {
+        if let AppState::SearchingModpackVersionsLoading { ref hit, ref mut rx } = self.state
+            && let Ok(res) = rx.try_recv() {
                 versions_finished_state = Some((hit.clone(), res));
             }
-        }
         if let Some((hit, res)) = versions_finished_state {
             match res {
                 Ok(versions) => {
@@ -584,7 +582,7 @@ impl App {
             while let Ok(res) = rx_status.try_recv() {
                 let res_val: Result<(), String> = res;
                 *status = Some(res_val.clone());
-                if let Err(_) = res_val {
+                if res_val.is_err() {
                     let instance_path = self.config.game_dir.join("instances").join(instance_id);
                     let latest_log_content = logs.join("\n");
                     *crash_analysis = crate::crash_analyzer::analyze_crash(&instance_path, &latest_log_content);
@@ -681,34 +679,32 @@ impl App {
             let details_res = if version_json_path.exists() {
                 let launcher = Launcher::new(self.config.clone());
                 launcher.load_version_details_raw(&version_id_clone)
-            } else {
-                if version_id_clone.starts_with("fabric-loader-") {
-                    if let Some(rest) = version_id_clone.strip_prefix("fabric-loader-") {
-                        if let Some((loader_ver, game_ver)) = rest.split_once('-') {
-                            api.fetch_fabric_profile(game_ver, loader_ver).await
-                        } else {
-                            Err("Invalid Fabric version ID format".to_string())
-                        }
+            } else if version_id_clone.starts_with("fabric-loader-") {
+                if let Some(rest) = version_id_clone.strip_prefix("fabric-loader-") {
+                    if let Some((loader_ver, game_ver)) = rest.split_once('-') {
+                        api.fetch_fabric_profile(game_ver, loader_ver).await
                     } else {
-                        Err("Invalid Fabric prefix".to_string())
+                        Err("Invalid Fabric version ID format".to_string())
                     }
-                } else if version_id_clone.starts_with("forge-") {
-                    let loader_ver = version_id_clone.strip_prefix("forge-").unwrap_or_default();
-                    api.fetch_forge_profile(loader_ver).await
-                } else if version_id_clone.starts_with("neoforge-") {
-                    let loader_ver = version_id_clone.strip_prefix("neoforge-").unwrap_or_default();
-                    api.fetch_neoforge_profile(loader_ver).await
                 } else {
-                    match api.fetch_version_manifest().await {
-                        Ok(manifest) => {
-                            if let Some(brief) = manifest.versions.iter().find(|v| v.id == version_id_clone) {
-                                api.fetch_version_details(&brief.url).await
-                            } else {
-                                Err(format!("Minecraft version '{}' not found in Mojang manifest.", version_id_clone))
-                            }
+                    Err("Invalid Fabric prefix".to_string())
+                }
+            } else if version_id_clone.starts_with("forge-") {
+                let loader_ver = version_id_clone.strip_prefix("forge-").unwrap_or_default();
+                api.fetch_forge_profile(loader_ver).await
+            } else if version_id_clone.starts_with("neoforge-") {
+                let loader_ver = version_id_clone.strip_prefix("neoforge-").unwrap_or_default();
+                api.fetch_neoforge_profile(loader_ver).await
+            } else {
+                match api.fetch_version_manifest().await {
+                    Ok(manifest) => {
+                        if let Some(brief) = manifest.versions.iter().find(|v| v.id == version_id_clone) {
+                            api.fetch_version_details(&brief.url).await
+                        } else {
+                            Err(format!("Minecraft version '{}' not found in Mojang manifest.", version_id_clone))
                         }
-                        Err(e) => Err(e),
                     }
+                    Err(e) => Err(e),
                 }
             };
 
@@ -811,7 +807,7 @@ impl App {
             ])
             .split(size);
 
-        let logo = format!(" ✦ MineCLI Terminal Launcher ✦ ");
+        let logo = " ✦ MineCLI Terminal Launcher ✦ ".to_string();
         let logo_p = Paragraph::new(logo)
             .style(Style::default().fg(Color::Rgb(155, 89, 182)).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(border_color)));
@@ -853,12 +849,10 @@ impl App {
     }
 
     fn draw_sidebar(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
-        let menu_items = vec![
-            "[D] Dashboard",
+        let menu_items = ["[D] Dashboard",
             "[I] Instances",
             "[A] Accounts",
-            "[S] Settings",
-        ];
+            "[S] Settings"];
 
         let list_items: Vec<ListItem> = menu_items.iter().enumerate().map(|(idx, item)| {
             let tab_match = match idx {
@@ -974,8 +968,8 @@ impl App {
             f.render_widget(logs_p, logs_area);
 
             // Render crash diagnostics card if present
-            if let Some(crash) = crash_analysis {
-                if let Some(area) = crash_area {
+            if let Some(crash) = crash_analysis
+                && let Some(area) = crash_area {
                     let card_block = Block::default()
                         .title(" Crash Diagnostics ")
                         .borders(Borders::ALL)
@@ -1001,7 +995,6 @@ impl App {
                         .wrap(Wrap { trim: true });
                     f.render_widget(card_p, area);
                 }
-            }
 
             // Render footer
             let footer_text = match status {
@@ -2479,8 +2472,8 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(idx) = list_state.selected() {
-                            if let Some(hit) = hits.get(idx) {
+                        if let Some(idx) = list_state.selected()
+                            && let Some(hit) = hits.get(idx) {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let client = self.api_client.clone();
                                 let project_id = hit.project_id.clone();
@@ -2490,7 +2483,6 @@ impl App {
                                 });
                                 self.state = AppState::SearchingModpackVersionsLoading { hit: hit.clone(), rx };
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -2516,8 +2508,8 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(idx) = list_state.selected() {
-                            if let Some(version) = versions.get(idx) {
+                        if let Some(idx) = list_state.selected()
+                            && let Some(version) = versions.get(idx) {
                                 if let Some(file) = version.files.iter().find(|f| f.primary || f.filename.ends_with(".mrpack")) {
                                     let url = file.url.clone();
                                     let filename = file.filename.clone();
@@ -2533,7 +2525,6 @@ impl App {
                                     self.status_message = Some(("No primary .mrpack file found in this version.".to_string(), true));
                                 }
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -2729,8 +2720,8 @@ impl App {
                         self.filter_versions();
                     }
                     KeyCode::Enter => {
-                        if let Some(idx) = self.version_list_state.selected() {
-                            if let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
+                        if let Some(idx) = self.version_list_state.selected()
+                            && let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
                                 let id_clone = id.clone();
                                 let name_clone = name.clone();
                                 let game_version = brief.id.clone();
@@ -2791,7 +2782,6 @@ impl App {
                                 };
                                 self.version_search_query.clear();
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -3210,9 +3200,9 @@ impl App {
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
                             // Toggle enabled/disabled
-                            if let Some(selected) = mod_list_state.selected() {
-                                if let Some(inst) = self.instances.get(instance_idx) {
-                                    if let Some(m) = mods.get_mut(selected) {
+                            if let Some(selected) = mod_list_state.selected()
+                                && let Some(inst) = self.instances.get(instance_idx)
+                                    && let Some(m) = mods.get_mut(selected) {
                                         let mods_dir = inst.path.join("mods");
                                         let old_path = mods_dir.join(&m.filename);
                                         let new_filename = if m.enabled {
@@ -3226,8 +3216,6 @@ impl App {
                                             m.enabled = !m.enabled;
                                         }
                                     }
-                                }
-                            }
                             self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
                         }
                         _ => {
@@ -3261,12 +3249,11 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(idx) = self.instances_list_state.selected() {
-                            if let Some(inst) = self.instances.get(idx) {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx) {
                                 self.config.active_instance = Some(inst.id.clone());
                                 let _ = self.config.save();
                             }
-                        }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') => {
                         self.state = AppState::CreatingInstanceName;
@@ -3278,8 +3265,8 @@ impl App {
                         }
                     }
                     KeyCode::Char('d') | KeyCode::Char('D') => {
-                        if let Some(idx) = self.instances_list_state.selected() {
-                            if let Some(inst) = self.instances.get(idx).cloned() {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx).cloned() {
                                 let _ = inst.delete();
                                 if self.config.active_instance.as_ref() == Some(&inst.id) {
                                     self.config.active_instance = None;
@@ -3287,11 +3274,10 @@ impl App {
                                 }
                                 self.refresh_instances();
                             }
-                        }
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
-                        if let Some(idx) = self.instances_list_state.selected() {
-                            if let Some(inst) = self.instances.get(idx).cloned() {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx).cloned() {
                                 let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
                                 let game_dir = self.config.game_dir.clone();
                                 tokio::spawn(async move {
@@ -3306,11 +3292,10 @@ impl App {
                                     rx,
                                 };
                             }
-                        }
                     }
                     KeyCode::Char('b') | KeyCode::Char('B') => {
-                        if let Some(idx) = self.instances_list_state.selected() {
-                            if let Some(inst) = self.instances.get(idx) {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx) {
                                 let backups = inst.list_backups();
                                 let mut state = ListState::default();
                                 if !backups.is_empty() {
@@ -3322,11 +3307,10 @@ impl App {
                                     backups_list_state: state,
                                 };
                             }
-                        }
                     }
                     KeyCode::Char('m') | KeyCode::Char('M') => {
-                        if let Some(idx) = self.instances_list_state.selected() {
-                            if let Some(inst) = self.instances.get(idx) {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx) {
                                 let mods = inst.get_mods().unwrap_or_default();
                                 let mut mod_list_state = ListState::default();
                                 if !mods.is_empty() {
@@ -3338,7 +3322,6 @@ impl App {
                                     mod_list_state,
                                 };
                             }
-                        }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
                         self.state = AppState::ModpackMenu { selected_option: 0 };
@@ -3368,12 +3351,11 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(idx) = self.account_list_state.selected() {
-                            if let Some(acc) = self.config.accounts.get(idx) {
+                        if let Some(idx) = self.account_list_state.selected()
+                            && let Some(acc) = self.config.accounts.get(idx) {
                                 self.config.active_account_uuid = Some(acc.uuid.clone());
                                 let _ = self.config.save();
                             }
-                        }
                     }
                     KeyCode::Char('o') | KeyCode::Char('O') => {
                         self.start_offline_account_flow();
@@ -3382,8 +3364,8 @@ impl App {
                         self.start_microsoft_account_flow();
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {
-                        if let Some(idx) = self.account_list_state.selected() {
-                            if let Some(acc) = self.config.accounts.get(idx).cloned() {
+                        if let Some(idx) = self.account_list_state.selected()
+                            && let Some(acc) = self.config.accounts.get(idx).cloned() {
                                 self.config.remove_account(&acc.uuid);
                                 let len = self.config.accounts.len();
                                 if len == 0 {
@@ -3392,7 +3374,6 @@ impl App {
                                     self.account_list_state.select(Some(idx.min(len - 1)));
                                 }
                             }
-                        }
                     }
                     _ => {}
                 }
@@ -3453,16 +3434,14 @@ pub async fn run_tui() -> Result<(), String> {
         
         terminal.draw(|f| app.draw(f)).map_err(|e| format!("Failed to draw TUI: {}", e))?;
 
-        if event::poll(Duration::from_millis(50)).map_err(|e| format!("Poll failed: {}", e))? {
-            if let Event::Key(key) = event::read().map_err(|e| format!("Failed to read key: {}", e))? {
-                if key.kind == event::KeyEventKind::Press {
+        if event::poll(Duration::from_millis(50)).map_err(|e| format!("Poll failed: {}", e))?
+            && let Event::Key(key) = event::read().map_err(|e| format!("Failed to read key: {}", e))?
+                && key.kind == event::KeyEventKind::Press {
                     let should_quit = app.handle_key(key).await;
                     if should_quit {
                         break;
                     }
                 }
-            }
-        }
     }
 
     disable_raw_mode().map_err(|e| format!("Failed to disable raw mode: {}", e))?;

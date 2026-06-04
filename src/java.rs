@@ -26,11 +26,10 @@ where
     };
 
     // If already installed and exists, use it
-    if runtime_dir.exists() {
-        if let Some(exe_path) = find_java_executable(&runtime_dir, &java_exe_subpath) {
+    if runtime_dir.exists()
+        && let Some(exe_path) = find_java_executable(&runtime_dir, &java_exe_subpath) {
             return Ok(exe_path);
         }
-    }
 
     log_fn(format!("Installing Java {} (Adoptium JRE)... This may take a minute.", major_version));
     fs::create_dir_all(&runtime_dir).map_err(|e| format!("Failed to create runtime dir: {}", e))?;
