@@ -296,9 +296,9 @@ impl Downloader {
                             Ok(())
                         };
 
-                        if result.is_ok() {
-                            if let Ok(res) = client.get(&url).send().await {
-                                if res.status().is_success()
+                        if result.is_ok()
+                            && let Ok(res) = client.get(&url).send().await
+                                && res.status().is_success()
                                     && let Ok(bytes) = res.bytes().await
                                         && fs::write(&path, &bytes).is_ok() {
                                             let verified = Self::verify_sha1(&path, &sha1);
@@ -317,8 +317,6 @@ impl Downloader {
                                                 return Ok(());
                                             }
                                         }
-                            }
-                        }
                         Err(format!("Failed to download asset: {}", name))
                     }
                 });
