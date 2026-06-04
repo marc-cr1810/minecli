@@ -165,6 +165,18 @@ enum InstanceAction {
         #[arg(short, long)]
         id: Option<String>,
     },
+    /// Search for Modrinth modpacks
+    SearchPack {
+        /// Search query
+        query: String,
+    },
+    /// Export an instance as a Modrinth .mrpack modpack
+    ExportPack {
+        /// Instance ID to export
+        id: String,
+        /// Output path for the .mrpack file
+        output_path: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -325,7 +337,7 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
 
     let details = if version_json_path.exists() {
         let launcher = Launcher::new(config.clone());
-        launcher.load_version_details(version_id)?
+        launcher.load_version_details_raw(version_id)?
     } else {
         if version_id.starts_with("fabric-loader-") {
             let rest = version_id.strip_prefix("fabric-loader-").unwrap();
@@ -815,6 +827,41 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 Err(e) => return Err(format!("Import task panicked: {}", e)),
             }
         }
+        InstanceAction::SearchPack { query } => {
+            let api = ApiClient::new();
+            println!("Searching Modrinth for modpacks matching '{}'...", query);
+            let hits = api.search_modpacks(&query).await?;
+            if hits.is_empty() {
+                println!("No modpacks found.");
+            } else {
+                println!("{:<24} | {:<20} | {:<12} | {}", "Title", "ID/Slug", "Downloads", "Description");
+                println!("{}", "-".repeat(80));
+                for hit in hits {
+                    let desc = if hit.description.len() > 40 {
+                        format!("{}...", &hit.description[..37])
+                    } else {
+                        hit.description.clone()
+                    };
+                    println!(
+                        "{:<24} | {:<20} | {:<12} | {}",
+                        hit.title,
+                        hit.project_id,
+                        hit.downloads,
+                        desc
+                    );
+                }
+            }
+        }
+        InstanceAction::ExportPack { id, output_path } => {
+            let instances = Instance::load_all(&config.game_dir);
+            let inst = instances.iter().find(|i| i.id == id)
+                .ok_or_else(|| format!("Instance '{}' not found.", id))?;
+
+            let out_path = std::path::PathBuf::from(&output_path);
+            println!("Exporting instance '{}' to '{}'...", id, out_path.display());
+            inst.export_mrpack(&out_path)?;
+            println!("Successfully exported modpack!");
+        }
     }
     Ok(())
 }
@@ -974,7 +1021,23 @@ async fn handle_cli_launch(
         .join(&version_id)
         .join(format!("{}.json", version_id));
 
-    if !skip_downloads && (!version_json_path.exists() || !config.game_dir.join("versions").join(&version_id).join(format!("{}.jar", version_id)).exists()) {
+    let jar_version_id = if version_json_path.exists() {
+        let launcher = Launcher::new(config.clone());
+        if let Ok(raw_details) = launcher.load_version_details_raw(&version_id) {
+            raw_details.inheritsFrom.clone().unwrap_or_else(|| version_id.clone())
+        } else {
+            version_id.clone()
+        }
+    } else {
+        version_id.clone()
+    };
+
+    let client_jar_path = config.game_dir
+        .join("versions")
+        .join(&jar_version_id)
+        .join(format!("{}.jar", jar_version_id));
+
+    if !skip_downloads && (!version_json_path.exists() || !client_jar_path.exists()) {
         download_version_files(&config, &version_id).await?;
     }
 

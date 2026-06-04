@@ -460,6 +460,109 @@ impl Instance {
         Ok(())
     }
 
+    pub fn export_mrpack(&self, output_path: &Path) -> Result<(), String> {
+        let file = File::create(output_path).map_err(|e| format!("Failed to create output file: {}", e))?;
+        let mut zip = zip::ZipWriter::new(file);
+
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+
+        // 1. Dependencies
+        let mut dependencies = HashMap::new();
+        
+        let (mc_ver, loader_name, loader_ver) = if self.config.version.starts_with("fabric-loader-") {
+            let parts: Vec<&str> = self.config.version.split('-').collect();
+            if parts.len() >= 4 {
+                (parts[3].to_string(), Some("fabric-loader".to_string()), Some(parts[2].to_string()))
+            } else {
+                (self.config.version.clone(), None, None)
+            }
+        } else if self.config.version.starts_with("forge-") {
+            let loader = self.config.version.strip_prefix("forge-").unwrap().to_string();
+            (self.config.version.clone(), Some("forge".to_string()), Some(loader))
+        } else if self.config.version.starts_with("neoforge-") {
+            let loader = self.config.version.strip_prefix("neoforge-").unwrap().to_string();
+            (self.config.version.clone(), Some("neoforge".to_string()), Some(loader))
+        } else {
+            (self.config.version.clone(), None, None)
+        };
+
+        dependencies.insert("minecraft".to_string(), mc_ver);
+        if let (Some(l_name), Some(l_ver)) = (loader_name, loader_ver) {
+            dependencies.insert(l_name, l_ver);
+        }
+
+        // 2. Add overrides/mods/
+        let mods_dir = self.path.join("mods");
+        if mods_dir.exists() {
+            if let Ok(entries) = fs::read_dir(&mods_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        let filename = entry.file_name().to_string_lossy().to_string();
+                        if !filename.ends_with(".disabled") {
+                            let zip_path = format!("overrides/mods/{}", filename);
+                            zip.start_file(zip_path, options).map_err(|e| e.to_string())?;
+                            let mut f = File::open(&path).map_err(|e| e.to_string())?;
+                            let mut buffer = Vec::new();
+                            f.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+                            zip.write_all(&buffer).map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Add overrides/config/
+        let config_dir = self.path.join("config");
+        if config_dir.exists() {
+            fn zip_config_recursive(
+                current_dir: &Path,
+                base_dir: &Path,
+                writer: &mut zip::ZipWriter<File>,
+                options: zip::write::FileOptions,
+            ) -> Result<(), String> {
+                for entry in fs::read_dir(current_dir).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let path = entry.path();
+                    let rel_path = path.strip_prefix(base_dir).map_err(|e| e.to_string())?;
+                    let name = format!("overrides/config/{}", rel_path.to_string_lossy());
+
+                    if path.is_dir() {
+                        writer.add_directory(&name, options).map_err(|e| e.to_string())?;
+                        zip_config_recursive(&path, base_dir, writer, options)?;
+                    } else {
+                        writer.start_file(&name, options).map_err(|e| e.to_string())?;
+                        let mut f = File::open(&path).map_err(|e| e.to_string())?;
+                        let mut buffer = Vec::new();
+                        f.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+                        writer.write_all(&buffer).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(())
+            }
+            let _ = zip.add_directory("overrides/config/", options);
+            zip_config_recursive(&config_dir, &config_dir, &mut zip, options)?;
+        }
+
+        // 4. Write modrinth.index.json
+        zip.start_file("modrinth.index.json", options).map_err(|e| e.to_string())?;
+        let index_json = serde_json::json!({
+            "formatVersion": 1,
+            "game": "minecraft",
+            "name": self.config.name,
+            "versionId": self.id,
+            "files": [],
+            "dependencies": dependencies
+        });
+        let index_str = serde_json::to_string_pretty(&index_json).map_err(|e| e.to_string())?;
+        zip.write_all(index_str.as_bytes()).map_err(|e| e.to_string())?;
+
+        zip.finish().map_err(|e| format!("Failed to finalize ZIP: {}", e))?;
+        Ok(())
+    }
+
     pub async fn import_mrpack(
         game_dir: &Path,
         pack_path: &Path,

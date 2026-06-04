@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::fs::{self, File};
 use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -112,6 +113,37 @@ enum AppState {
         message: String,
         logs: Vec<String>,
         rx: Receiver<ProgressUpdate>,
+    },
+    ModpackMenu {
+        selected_option: usize,
+    },
+    SearchingModpackQuery,
+    SearchingModpackLoading {
+        query: String,
+        rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthSearchHit>, String>>,
+    },
+    SearchingModpackResults {
+        query: String,
+        hits: Vec<crate::api::ModrinthSearchHit>,
+        list_state: ListState,
+    },
+    SearchingModpackVersionsLoading {
+        hit: crate::api::ModrinthSearchHit,
+        rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthVersion>, String>>,
+    },
+    SearchingModpackVersions {
+        hit: crate::api::ModrinthSearchHit,
+        versions: Vec<crate::api::ModrinthVersion>,
+        list_state: ListState,
+    },
+    SearchingModpackConfirmId {
+        hit: crate::api::ModrinthSearchHit,
+        version: crate::api::ModrinthVersion,
+        url: String,
+        filename: String,
+    },
+    ExportingModpackPath {
+        instance_idx: usize,
     },
 }
 
@@ -495,6 +527,52 @@ impl App {
             self.refresh_instances();
         }
 
+        // 3c. Process Modrinth search results
+        let mut search_finished_state = None;
+        if let AppState::SearchingModpackLoading { ref query, ref mut rx } = self.state {
+            if let Ok(res) = rx.try_recv() {
+                search_finished_state = Some((query.clone(), res));
+            }
+        }
+        if let Some((query, res)) = search_finished_state {
+            match res {
+                Ok(hits) => {
+                    let mut list_state = ListState::default();
+                    if !hits.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    self.state = AppState::SearchingModpackResults { query, hits, list_state };
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Search failed: {}", e), true));
+                    self.state = AppState::SearchingModpackQuery;
+                }
+            }
+        }
+
+        // 3d. Process Modrinth version results
+        let mut versions_finished_state = None;
+        if let AppState::SearchingModpackVersionsLoading { ref hit, ref mut rx } = self.state {
+            if let Ok(res) = rx.try_recv() {
+                versions_finished_state = Some((hit.clone(), res));
+            }
+        }
+        if let Some((hit, res)) = versions_finished_state {
+            match res {
+                Ok(versions) => {
+                    let mut list_state = ListState::default();
+                    if !versions.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    self.state = AppState::SearchingModpackVersions { hit, versions, list_state };
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Failed to load versions: {}", e), true));
+                    self.state = AppState::Normal;
+                }
+            }
+        }
+
         // 4. Process Game Log streams and termination status
         if let AppState::GameRunning { ref mut logs, ref mut rx_logs, ref mut rx_status, ref mut status, ref mut crash_analysis, ref mut scroll_offset, auto_scroll, ref instance_id, .. } = self.state {
             while let Ok(line) = rx_logs.try_recv() {
@@ -573,6 +651,104 @@ impl App {
                 return;
             }
         };
+
+        let version_id = instance.config.version.clone();
+        let version_json_path = self.config.game_dir
+            .join("versions")
+            .join(&version_id)
+            .join(format!("{}.json", version_id));
+        let jar_version_id = if version_json_path.exists() {
+            let launcher = Launcher::new(self.config.clone());
+            if let Ok(raw_details) = launcher.load_version_details_raw(&version_id) {
+                raw_details.inheritsFrom.clone().unwrap_or_else(|| version_id.clone())
+            } else {
+                version_id.clone()
+            }
+        } else {
+            version_id.clone()
+        };
+
+        let client_jar_path = self.config.game_dir
+            .join("versions")
+            .join(&jar_version_id)
+            .join(format!("{}.jar", jar_version_id));
+
+        if !version_json_path.exists() || !client_jar_path.exists() {
+            let api = self.api_client.clone();
+            let version_id_clone = version_id.clone();
+            
+            // Check loader type and fetch profile details
+            let details_res = if version_json_path.exists() {
+                let launcher = Launcher::new(self.config.clone());
+                launcher.load_version_details_raw(&version_id_clone)
+            } else {
+                if version_id_clone.starts_with("fabric-loader-") {
+                    if let Some(rest) = version_id_clone.strip_prefix("fabric-loader-") {
+                        if let Some((loader_ver, game_ver)) = rest.split_once('-') {
+                            api.fetch_fabric_profile(game_ver, loader_ver).await
+                        } else {
+                            Err("Invalid Fabric version ID format".to_string())
+                        }
+                    } else {
+                        Err("Invalid Fabric prefix".to_string())
+                    }
+                } else if version_id_clone.starts_with("forge-") {
+                    let loader_ver = version_id_clone.strip_prefix("forge-").unwrap_or_default();
+                    api.fetch_forge_profile(loader_ver).await
+                } else if version_id_clone.starts_with("neoforge-") {
+                    let loader_ver = version_id_clone.strip_prefix("neoforge-").unwrap_or_default();
+                    api.fetch_neoforge_profile(loader_ver).await
+                } else {
+                    match api.fetch_version_manifest().await {
+                        Ok(manifest) => {
+                            if let Some(brief) = manifest.versions.iter().find(|v| v.id == version_id_clone) {
+                                api.fetch_version_details(&brief.url).await
+                            } else {
+                                Err(format!("Minecraft version '{}' not found in Mojang manifest.", version_id_clone))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            };
+
+            let details = match details_res {
+                Ok(d) => d,
+                Err(e) => {
+                    self.status_message = Some((format!("Failed to retrieve version details: {}", e), true));
+                    return;
+                }
+            };
+
+            if !version_json_path.exists() {
+                if let Some(parent) = version_json_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(content) = serde_json::to_string_pretty(&details) {
+                    let _ = std::fs::write(&version_json_path, content);
+                }
+            }
+
+            let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+            let game_dir = self.config.game_dir.clone();
+            let details_clone = details.clone();
+            tokio::spawn(async move {
+                let downloader = Downloader::new(tx);
+                let _ = downloader.download_version(&game_dir, &details_clone).await;
+            });
+
+            self.state = AppState::Downloading {
+                completed: 0,
+                total: 100,
+                current_file: String::new(),
+                message: format!("Installing game files for {}...", version_id),
+                logs: Vec::new(),
+                rx,
+                version_details: details,
+            };
+            self.status_message = None;
+            return;
+        }
 
         let account = match self.config.get_active_account() {
             Some(acc) => acc.clone(),
@@ -1234,6 +1410,268 @@ impl App {
                 f.render_widget(input_p, inner_layout[2]);
 
                 let help = Paragraph::new("Press [Enter] to Next, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::ModpackMenu { selected_option } => {
+                let area = self.get_centered_rect(50, 25, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Import Modpack Option ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                f.render_widget(Paragraph::new("Select how you want to import the modpack:").style(Style::default().fg(Color::Rgb(180, 180, 180))), chunks[0]);
+
+                let opt0 = if selected_option == 0 { "-> [1] Search Modrinth for Modpacks" } else { "   [1] Search Modrinth for Modpacks" };
+                let opt1 = if selected_option == 1 { "-> [2] Import Local .mrpack File" } else { "   [2] Import Local .mrpack File" };
+                
+                let style0 = if selected_option == 0 { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+                let style1 = if selected_option == 1 { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
+
+                let text = vec![
+                    Line::from(Span::styled(opt0, style0)),
+                    Line::from(Span::styled(opt1, style1)),
+                ];
+                f.render_widget(Paragraph::new(text), chunks[1]);
+
+                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to select, [Esc] to cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, chunks[2]);
+            }
+
+            AppState::SearchingModpackQuery => {
+                let area = self.get_centered_rect(60, 20, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Search Modrinth Modpacks ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter modpack name or query:"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Search, [Esc] to Back")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::SearchingModpackLoading { ref query, .. } => {
+                let area = self.get_centered_rect(50, 15, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Searching Modrinth ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let p = Paragraph::new(format!("\nSearching for \"{}\"...\nPlease wait.", query))
+                    .style(Style::default().fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, inner);
+            }
+
+            AppState::SearchingModpackResults { ref query, ref hits, ref list_state } => {
+                let area = self.get_centered_rect(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Modrinth Search: \"{}\" ", query))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(3),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = hits.iter().map(|hit| {
+                    let item_line = Line::from(vec![
+                        Span::styled(format!(" {:<30}", hit.title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" By: {:<15}", hit.author), Style::default().fg(Color::Rgb(150, 150, 150))),
+                        Span::styled(format!(" Downloads: {:<12}", hit.downloads), Style::default().fg(Color::Cyan)),
+                    ]);
+                    ListItem::new(item_line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Matching Modpacks ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = list_state.clone();
+                f.render_stateful_widget(list, chunks[0], &mut state);
+
+                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to select version, [Esc] to Search Query")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, chunks[1]);
+            }
+
+            AppState::SearchingModpackVersionsLoading { ref hit, .. } => {
+                let area = self.get_centered_rect(50, 15, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Fetching Versions ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let p = Paragraph::new(format!("\nFetching versions for \"{}\"...\nPlease wait.", hit.title))
+                    .style(Style::default().fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, inner);
+            }
+
+            AppState::SearchingModpackVersions { ref hit, ref versions, ref list_state } => {
+                let area = self.get_centered_rect(75, 75, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Versions for \"{}\" ", hit.title))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(3),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = versions.iter().map(|ver| {
+                    let game_vers = ver.game_versions.join(", ");
+                    let item_line = Line::from(vec![
+                        Span::styled(format!(" {:<30}", ver.name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" Game Versions: {}", game_vers), Style::default().fg(Color::Cyan)),
+                    ]);
+                    ListItem::new(item_line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Available Versions ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = list_state.clone();
+                f.render_stateful_widget(list, chunks[0], &mut state);
+
+                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to download/import, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, chunks[1]);
+            }
+
+            AppState::SearchingModpackConfirmId { ref hit, ref version, .. } => {
+                let area = self.get_centered_rect(50, 22, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(format!(" Import Modpack: {} ", hit.title))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new(format!("Version: {} (for MC {})", version.version_number, version.game_versions.join(", "))).style(Style::default().fg(Color::Cyan)), inner_layout[0]);
+                f.render_widget(Paragraph::new("Enter desired folder name/ID for this modpack:"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Download & Import, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::ExportingModpackPath { instance_idx } => {
+                let area = self.get_centered_rect(60, 20, size);
+                f.render_widget(Clear, area);
+                
+                let inst_name = self.instances.get(instance_idx).map(|i| i.config.name.as_str()).unwrap_or("Instance");
+                let block = Block::default()
+                    .title(format!(" Export '{}' to Modpack (.mrpack) ", inst_name))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter output file path (e.g. /path/to/my-pack.mrpack):"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Export, [Esc] to Cancel")
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(help, inner_layout[3]);
@@ -1963,6 +2401,271 @@ impl App {
                 }
             }
 
+            AppState::ModpackMenu { ref mut selected_option } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if *selected_option > 0 {
+                            *selected_option -= 1;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if *selected_option < 1 {
+                            *selected_option += 1;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if *selected_option == 0 {
+                            self.state = AppState::SearchingModpackQuery;
+                        } else {
+                            self.state = AppState::ImportingModpackPath;
+                        }
+                        self.version_search_query.clear();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModpackQuery => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::ModpackMenu { selected_option: 0 };
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let query = self.version_search_query.trim().to_string();
+                        if !query.is_empty() {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            let client = self.api_client.clone();
+                            let query_clone = query.clone();
+                            tokio::spawn(async move {
+                                let res = client.search_modpacks(&query_clone).await;
+                                let _ = tx.send(res);
+                            });
+                            self.state = AppState::SearchingModpackLoading { query, rx };
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModpackLoading { .. } => {}
+
+            AppState::SearchingModpackResults { ref query, ref hits, ref mut list_state } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        let q = query.clone();
+                        self.state = AppState::SearchingModpackQuery;
+                        self.version_search_query = q;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected + 1 < hits.len() {
+                            list_state.select(Some(selected + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = list_state.selected() {
+                            if let Some(hit) = hits.get(idx) {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let client = self.api_client.clone();
+                                let project_id = hit.project_id.clone();
+                                tokio::spawn(async move {
+                                    let res = client.fetch_modpack_versions(&project_id).await;
+                                    let _ = tx.send(res);
+                                });
+                                self.state = AppState::SearchingModpackVersionsLoading { hit: hit.clone(), rx };
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModpackVersionsLoading { .. } => {}
+
+            AppState::SearchingModpackVersions { ref hit, ref versions, ref mut list_state } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected + 1 < versions.len() {
+                            list_state.select(Some(selected + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = list_state.selected() {
+                            if let Some(version) = versions.get(idx) {
+                                if let Some(file) = version.files.iter().find(|f| f.primary || f.filename.ends_with(".mrpack")) {
+                                    let url = file.url.clone();
+                                    let filename = file.filename.clone();
+                                    let default_id = hit.title.to_lowercase().replace(' ', "-");
+                                    self.version_search_query = default_id;
+                                    self.state = AppState::SearchingModpackConfirmId {
+                                        hit: hit.clone(),
+                                        version: version.clone(),
+                                        url,
+                                        filename,
+                                    };
+                                } else {
+                                    self.status_message = Some(("No primary .mrpack file found in this version.".to_string(), true));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModpackConfirmId { hit: _, version: _, ref url, ref filename } => {
+                let url = url.clone();
+                let filename = filename.clone();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let custom_id = self.version_search_query.trim().to_string();
+                        if !custom_id.is_empty() {
+                            let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                            let game_dir = self.config.game_dir.clone();
+                            let url_clone = url.clone();
+                            let filename_clone = filename.clone();
+                            let custom_id_clone = custom_id.clone();
+                            
+                            tokio::spawn(async move {
+                                let temp_dir = game_dir.join("cache").join("temp_packs");
+                                let _ = fs::create_dir_all(&temp_dir);
+                                let dest_path = temp_dir.join(&filename_clone);
+                                
+                                let _ = tx.send(ProgressUpdate::Started {
+                                    total: 100,
+                                    message: format!("Downloading modpack {}...", filename_clone),
+                                }).await;
+                                
+                                let client = reqwest::Client::new();
+                                let res = match client.get(&url_clone).header("User-Agent", "minecli/0.1.0").send().await {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let _ = tx.send(ProgressUpdate::Error(format!("Failed to download modpack: {}", e))).await;
+                                        return;
+                                    }
+                                };
+                                
+                                let total_size = res.content_length().unwrap_or(1);
+                                let mut file = match File::create(&dest_path) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        let _ = tx.send(ProgressUpdate::Error(format!("Failed to create temp file: {}", e))).await;
+                                        return;
+                                    }
+                                };
+                                
+                                let mut bytes_stream = res.bytes_stream();
+                                use futures_util::StreamExt;
+                                let mut downloaded = 0;
+                                while let Some(chunk_res) = bytes_stream.next().await {
+                                    let chunk = match chunk_res {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            let _ = tx.send(ProgressUpdate::Error(format!("Error while streaming download: {}", e))).await;
+                                            return;
+                                        }
+                                    };
+                                    if let Err(e) = std::io::copy(&mut chunk.as_ref(), &mut file) {
+                                        let _ = tx.send(ProgressUpdate::Error(format!("Failed to write chunk: {}", e))).await;
+                                        return;
+                                    }
+                                    downloaded += chunk.len() as u64;
+                                    let pct = ((downloaded * 100) / total_size) as usize;
+                                    let _ = tx.send(ProgressUpdate::Progress {
+                                        completed: pct,
+                                        total: 100,
+                                        current_file: filename_clone.clone(),
+                                    }).await;
+                                }
+                                
+                                let _ = Instance::import_mrpack(&game_dir, &dest_path, &custom_id_clone, &tx).await;
+                            });
+
+                            self.version_search_query.clear();
+                            self.state = AppState::ImportingModpackProgress {
+                                completed: 0,
+                                total: 100,
+                                current_file: String::new(),
+                                message: "Downloading pack...".to_string(),
+                                logs: Vec::new(),
+                                rx,
+                            };
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::ExportingModpackPath { instance_idx } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let path_str = self.version_search_query.trim().to_string();
+                        if !path_str.is_empty() {
+                            let path = std::path::Path::new(&path_str);
+                            if let Some(inst) = self.instances.get(instance_idx) {
+                                match inst.export_mrpack(path) {
+                                    Ok(()) => {
+                                        self.status_message = Some((format!("Successfully exported modpack to {}", path_str), false));
+                                    }
+                                    Err(e) => {
+                                        self.status_message = Some((format!("Failed to export modpack: {}", e), true));
+                                    }
+                                }
+                            }
+                            self.state = AppState::Normal;
+                            self.version_search_query.clear();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
             AppState::CreatingInstanceName => {
                 match key.code {
                     KeyCode::Esc => {
@@ -2442,7 +3145,7 @@ impl App {
 
                                             // Need to download the base game + loader libraries
                                             let launcher = Launcher::new(self.config.clone());
-                                            match launcher.load_version_details(&version_id) {
+                                            match launcher.load_version_details_raw(&version_id) {
                                                 Ok(details) => {
                                                     let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
                                                     let game_dir = self.config.game_dir.clone();
@@ -2457,7 +3160,7 @@ impl App {
                                                         message: format!("Installing {}...", version_id),
                                                         logs: Vec::new(),
                                                         rx,
-                                                        version_details: launcher.load_version_details(&version_id).unwrap(),
+                                                        version_details: launcher.load_version_details_raw(&version_id).unwrap(),
                                                     };
                                                 }
                                                 Err(e) => {
@@ -2638,8 +3341,13 @@ impl App {
                         }
                     }
                     KeyCode::Char('p') | KeyCode::Char('P') => {
-                        self.state = AppState::ImportingModpackPath;
-                        self.version_search_query.clear();
+                        self.state = AppState::ModpackMenu { selected_option: 0 };
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('X') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            self.state = AppState::ExportingModpackPath { instance_idx: idx };
+                            self.version_search_query.clear();
+                        }
                     }
                     _ => {}
                 }

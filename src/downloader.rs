@@ -148,6 +148,32 @@ impl Downloader {
                 .join("versions")
                 .join(parent_id)
                 .join(format!("{}.json", parent_id));
+
+            if !parent_json_path.exists() {
+                self.send_message(format!("Parent profile details missing for {}. Fetching details...", parent_id)).await;
+                let api = crate::api::ApiClient::new();
+                match api.fetch_version_manifest().await {
+                    Ok(manifest) => {
+                        if let Some(brief) = manifest.versions.iter().find(|v| &v.id == parent_id) {
+                            match api.fetch_version_details(&brief.url).await {
+                                Ok(parent_details) => {
+                                    if let Some(parent) = parent_json_path.parent() {
+                                        let _ = fs::create_dir_all(parent);
+                                    }
+                                    if let Ok(content) = serde_json::to_string_pretty(&parent_details) {
+                                        let _ = fs::write(&parent_json_path, content);
+                                    }
+                                }
+                                Err(e) => return Err(format!("Failed to fetch details for parent {}: {}", parent_id, e)),
+                            }
+                        } else {
+                            return Err(format!("Parent Minecraft version '{}' not found in Mojang manifest.", parent_id));
+                        }
+                    }
+                    Err(e) => return Err(format!("Failed to fetch version manifest for parent: {}", e)),
+                }
+            }
+
             if parent_json_path.exists() {
                 if let Ok(parent_content) = fs::read_to_string(&parent_json_path) {
                     if let Ok(parent_details) = serde_json::from_str::<VersionDetails>(&parent_content) {

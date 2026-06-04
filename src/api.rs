@@ -406,6 +406,7 @@ pub struct MinecraftProfile {
 
 // --- API Client ---
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
 }
@@ -673,6 +674,32 @@ impl ApiClient {
             .await
             .map_err(|e| format!("Failed to parse NeoForge profile: {}", e))
     }
+
+    pub async fn search_modpacks(&self, query: &str) -> Result<Vec<ModrinthSearchHit>, String> {
+        let url = "https://api.modrinth.com/v2/search";
+        self.client.get(url)
+            .query(&[("query", query), ("facets", "[[\"project_type:modpack\"]]")])
+            .header("User-Agent", "minecli/0.1.0 (contact@minecli.invalid)")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to search Modrinth: {}", e))?
+            .json::<ModrinthSearchResponse>()
+            .await
+            .map(|r| r.hits)
+            .map_err(|e| format!("Failed to parse Modrinth search response: {}", e))
+    }
+
+    pub async fn fetch_modpack_versions(&self, project_id: &str) -> Result<Vec<ModrinthVersion>, String> {
+        let url = format!("https://api.modrinth.com/v2/project/{}/version", project_id);
+        self.client.get(&url)
+            .header("User-Agent", "minecli/0.1.0 (contact@minecli.invalid)")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch modpack versions: {}", e))?
+            .json::<Vec<ModrinthVersion>>()
+            .await
+            .map_err(|e| format!("Failed to parse modpack versions: {}", e))
+    }
 }
 
 // --- Fabric response models ---
@@ -706,6 +733,42 @@ pub struct PrismMetaIndex {
     pub name: String,
     pub uid: String,
     pub versions: Vec<PrismMetaVersion>,
+}
+
+// --- Modrinth search API response models ---
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthSearchHit {
+    #[serde(rename = "project_id")]
+    pub project_id: String,
+    pub title: String,
+    pub description: String,
+    pub downloads: u64,
+    pub author: String,
+    #[serde(rename = "latest_version")]
+    pub latest_version: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthSearchResponse {
+    pub hits: Vec<ModrinthSearchHit>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthVersionFile {
+    pub url: String,
+    pub filename: String,
+    pub primary: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthVersion {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "version_number")]
+    pub version_number: String,
+    pub files: Vec<ModrinthVersionFile>,
+    #[serde(rename = "game_versions")]
+    pub game_versions: Vec<String>,
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ impl Launcher {
         local_versions
     }
 
-    pub fn load_version_details(&self, version_id: &str) -> Result<VersionDetails, String> {
+    pub fn load_version_details_raw(&self, version_id: &str) -> Result<VersionDetails, String> {
         let json_path = self.config.game_dir
             .join("versions")
             .join(version_id)
@@ -55,6 +55,12 @@ impl Launcher {
             details.libraries.extend(maven_libs);
         }
 
+        Ok(details)
+    }
+
+    pub fn load_version_details(&self, version_id: &str) -> Result<VersionDetails, String> {
+        let mut details = self.load_version_details_raw(version_id)?;
+
         if let Some(ref parent_id) = details.inheritsFrom {
             let parent_details = self.load_version_details(parent_id)?;
             details = self.merge_version_details(details, parent_details);
@@ -64,8 +70,34 @@ impl Launcher {
     }
 
     fn merge_version_details(&self, mut child: VersionDetails, parent: VersionDetails) -> VersionDetails {
-        // Libraries: prepend parent's libraries
-        let mut merged_libraries = parent.libraries;
+        // Libraries: parent libraries merged with child libraries.
+        // If a library with the same group and name exists in both, the child's library overrides the parent's.
+        let mut merged_libraries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        let get_lib_key = |name: &str| -> String {
+            let parts: Vec<&str> = name.split(':').collect();
+            if parts.len() >= 2 {
+                format!("{}:{}", parts[0], parts[1])
+            } else {
+                name.to_string()
+            }
+        };
+
+        // We iterate child libraries first (because child overrides parent, we mark their keys as seen)
+        for lib in &child.libraries {
+            seen.insert(get_lib_key(&lib.name));
+        }
+
+        // Add parent libraries that aren't overridden by child libraries
+        for lib in parent.libraries {
+            let key = get_lib_key(&lib.name);
+            if !seen.contains(&key) {
+                merged_libraries.push(lib);
+            }
+        }
+
+        // Add child libraries
         merged_libraries.extend(child.libraries);
         child.libraries = merged_libraries;
 
