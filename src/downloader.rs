@@ -135,18 +135,37 @@ impl Downloader {
     }
 
     pub async fn download_version(&self, game_dir: &Path, version_details: &VersionDetails) -> Result<(), String> {
-        let version_id = &version_details.id;
+        let details_id = version_details.id();
+        let version_id = &details_id;
         self.send_message(format!("Resolving files for Minecraft {}...", version_id)).await;
 
         let version_dir = game_dir.join("versions").join(version_id);
         fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
 
+        // 0. Ensure parent is downloaded first if inheritsFrom is present
+        if let Some(ref parent_id) = version_details.inheritsFrom {
+            let parent_json_path = game_dir
+                .join("versions")
+                .join(parent_id)
+                .join(format!("{}.json", parent_id));
+            if parent_json_path.exists() {
+                if let Ok(parent_content) = fs::read_to_string(&parent_json_path) {
+                    if let Ok(parent_details) = serde_json::from_str::<VersionDetails>(&parent_content) {
+                        self.send_message(format!("Parent profile detected ({}). Ensuring parent is downloaded...", parent_id)).await;
+                        Box::pin(self.download_version(game_dir, &parent_details)).await?;
+                    }
+                }
+            }
+        }
+
         // 1. Download Client JAR
-        let client_jar_path = version_dir.join(format!("{}.jar", version_id));
-        let client_art = &version_details.downloads.client;
-        self.send_started(1, "Downloading client JAR...".to_string()).await;
-        self.download_file(&client_art.url, &client_jar_path, &client_art.sha1).await?;
-        self.send_progress(1, 1, "client.jar".to_string()).await;
+        if let Some(ref downloads) = version_details.downloads {
+            let client_jar_path = version_dir.join(format!("{}.jar", version_id));
+            let client_art = &downloads.client;
+            self.send_started(1, "Downloading client JAR...".to_string()).await;
+            self.download_file(&client_art.url, &client_jar_path, &client_art.sha1).await?;
+            self.send_progress(1, 1, "client.jar".to_string()).await;
+        }
 
         // 2. Download Libraries
         let libraries_dir = game_dir.join("libraries");
@@ -164,24 +183,23 @@ impl Downloader {
         };
 
         for lib in &version_details.libraries {
-            // Check library OS rules
             if let Some(ref rules) = lib.rules {
                 if !Rule::evaluate(rules) {
                     continue;
                 }
             }
 
-            // Normal library artifact
-            if let Some(ref art) = lib.downloads.artifact {
-                libs_to_download.push((art.clone(), false));
+            if let Some(art) = lib.get_artifact() {
+                libs_to_download.push((art, false));
             }
 
-            // Platform-specific natives classifiers (legacy style)
             if let Some(ref natives_map) = lib.natives {
                 if let Some(classifier) = natives_map.get(current_os) {
-                    if let Some(ref classifiers) = lib.downloads.classifiers {
-                        if let Some(art) = classifiers.get(classifier) {
-                            libs_to_download.push((art.clone(), true));
+                    if let Some(ref downloads) = lib.downloads {
+                        if let Some(ref classifiers) = downloads.classifiers {
+                            if let Some(art) = classifiers.get(classifier) {
+                                libs_to_download.push((art.clone(), true));
+                            }
                         }
                     }
                 }
@@ -208,100 +226,97 @@ impl Downloader {
         }
 
         // 3. Download Assets
-        let asset_index_ref = &version_details.assetIndex;
-        let index_dir = game_dir.join("assets").join("indexes");
-        fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
+        if let Some(ref asset_index_ref) = version_details.assetIndex {
+            let index_dir = game_dir.join("assets").join("indexes");
+            fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
 
-        let index_path = index_dir.join(format!("{}.json", asset_index_ref.id));
-        self.send_started(1, "Downloading asset index...".to_string()).await;
-        self.download_file(&asset_index_ref.url, &index_path, &asset_index_ref.sha1).await?;
-        self.send_progress(1, 1, format!("{}.json", asset_index_ref.id)).await;
+            let index_path = index_dir.join(format!("{}.json", asset_index_ref.id));
+            self.send_started(1, "Downloading asset index...".to_string()).await;
+            self.download_file(&asset_index_ref.url, &index_path, &asset_index_ref.sha1).await?;
+            self.send_progress(1, 1, format!("{}.json", asset_index_ref.id)).await;
 
-        // Parse Asset Index
-        let index_content = fs::read_to_string(&index_path).map_err(|e| e.to_string())?;
-        let asset_index: AssetIndex = serde_json::from_str(&index_content)
-            .map_err(|e| format!("Failed to parse asset index: {}", e))?;
+            let index_content = fs::read_to_string(&index_path).map_err(|e| e.to_string())?;
+            let asset_index: AssetIndex = serde_json::from_str(&index_content)
+                .map_err(|e| format!("Failed to parse asset index: {}", e))?;
 
-        let objects_dir = game_dir.join("assets").join("objects");
+            let objects_dir = game_dir.join("assets").join("objects");
 
-        let mut assets_to_download = Vec::new();
-        for (name, obj) in &asset_index.objects {
-            let hash = &obj.hash;
-            let first_two = &hash[0..2];
-            let url = format!("https://resources.download.minecraft.net/{}/{}", first_two, hash);
-            let path = objects_dir.join(first_two).join(hash);
-            assets_to_download.push((url, path, hash.clone(), name.clone()));
-        }
-
-        // Filter already matching assets
-        let mut missing_assets = Vec::new();
-        self.send_message("Verifying existing assets...".to_string()).await;
-        for item in assets_to_download {
-            if !Self::verify_sha1(&item.1, &item.2) {
-                missing_assets.push(item);
+            let mut assets_to_download = Vec::new();
+            for (name, obj) in &asset_index.objects {
+                let hash = &obj.hash;
+                let first_two = &hash[0..2];
+                let url = format!("https://resources.download.minecraft.net/{}/{}", first_two, hash);
+                let path = objects_dir.join(first_two).join(hash);
+                assets_to_download.push((url, path, hash.clone(), name.clone()));
             }
-        }
 
-        let total_assets = missing_assets.len();
-        if total_assets > 0 {
-            self.send_started(total_assets, "Downloading missing assets...".to_string()).await;
+            let mut missing_assets = Vec::new();
+            self.send_message("Verifying existing assets...".to_string()).await;
+            for item in assets_to_download {
+                if !Self::verify_sha1(&item.1, &item.2) {
+                    missing_assets.push(item);
+                }
+            }
 
-            let client = self.client.clone();
-            let completed = Arc::new(AtomicUsize::new(0));
-            let progress_tx = self.progress_tx.clone();
+            let total_assets = missing_assets.len();
+            if total_assets > 0 {
+                self.send_started(total_assets, "Downloading missing assets...".to_string()).await;
 
-            let futures = missing_assets.into_iter().map(|(url, path, sha1, name)| {
-                let client = client.clone();
-                let completed = completed.clone();
-                let progress_tx = progress_tx.clone();
-                async move {
-                    let result = if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent).map_err(|e| e.to_string())
-                    } else {
-                        Ok(())
-                    };
+                let client = self.client.clone();
+                let completed = Arc::new(AtomicUsize::new(0));
+                let progress_tx = self.progress_tx.clone();
 
-                    if result.is_ok() {
-                        match client.get(&url).send().await {
-                            Ok(res) => {
-                                if res.status().is_success() {
-                                    match res.bytes().await {
-                                        Ok(bytes) => {
-                                            if fs::write(&path, &bytes).is_ok() {
-                                                // Verify
-                                                let verified = Self::verify_sha1(&path, &sha1);
-                                                if verified {
-                                                    let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                                    let filename = Path::new(&name).file_name()
-                                                        .and_then(|f| f.to_str())
-                                                        .unwrap_or("asset")
-                                                        .to_string();
+                let futures = missing_assets.into_iter().map(|(url, path, sha1, name)| {
+                    let client = client.clone();
+                    let completed = completed.clone();
+                    let progress_tx = progress_tx.clone();
+                    async move {
+                        let result = if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|e| e.to_string())
+                        } else {
+                            Ok(())
+                        };
 
-                                                    let _ = progress_tx.send(ProgressUpdate::Progress {
-                                                        completed: count,
-                                                        total: total_assets,
-                                                        current_file: filename,
-                                                    }).await;
-                                                    return Ok(());
+                        if result.is_ok() {
+                            match client.get(&url).send().await {
+                                Ok(res) => {
+                                    if res.status().is_success() {
+                                        match res.bytes().await {
+                                            Ok(bytes) => {
+                                                if fs::write(&path, &bytes).is_ok() {
+                                                    let verified = Self::verify_sha1(&path, &sha1);
+                                                    if verified {
+                                                        let count = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                                        let filename = Path::new(&name).file_name()
+                                                            .and_then(|f| f.to_str())
+                                                            .unwrap_or("asset")
+                                                            .to_string();
+
+                                                        let _ = progress_tx.send(ProgressUpdate::Progress {
+                                                            completed: count,
+                                                            total: total_assets,
+                                                            current_file: filename,
+                                                        }).await;
+                                                        return Ok(());
+                                                    }
                                                 }
                                             }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
+                        Err(format!("Failed to download asset: {}", name))
                     }
-                    Err(format!("Failed to download asset: {}", name))
-                }
-            });
+                });
 
-            // Run concurrently with buffer limit of 16
-            let mut stream = futures_util::stream::iter(futures).buffer_unordered(16);
-            while let Some(res) = stream.next().await {
-                if let Err(e) = res {
-                    self.send_message(format!("Warning: {}", e)).await;
+                let mut stream = futures_util::stream::iter(futures).buffer_unordered(16);
+                while let Some(res) = stream.next().await {
+                    if let Err(e) = res {
+                        self.send_message(format!("Warning: {}", e)).await;
+                    }
                 }
             }
         }

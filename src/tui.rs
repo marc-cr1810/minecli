@@ -15,7 +15,7 @@ use crate::config::{Config, Account, AccountType, MicrosoftAuth};
 use crate::api::{ApiClient, VersionBrief, VersionDetails, VersionManifest};
 use crate::downloader::{Downloader, ProgressUpdate};
 use crate::launcher::Launcher;
-use crate::instance::Instance;
+use crate::instance::{Instance, InstanceMod};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum Tab {
@@ -88,6 +88,30 @@ enum AppState {
         instance_idx: usize,
         backups: Vec<String>,
         backups_list_state: ListState,
+    },
+    ChoosingModLoader {
+        instance_id: String,
+        instance_name: String,
+        game_version: String,
+        loader_options: Vec<String>,
+        loader_list_state: ListState,
+    },
+    ModManager {
+        instance_idx: usize,
+        mods: Vec<InstanceMod>,
+        mod_list_state: ListState,
+    },
+    ImportingModpackPath,
+    ImportingModpackId {
+        path: std::path::PathBuf,
+    },
+    ImportingModpackProgress {
+        completed: usize,
+        total: usize,
+        current_file: String,
+        message: String,
+        logs: Vec<String>,
+        rx: Receiver<ProgressUpdate>,
     },
 }
 
@@ -354,9 +378,9 @@ impl App {
                         *message = msg.clone();
                         logs.push(msg);
                     }
-                    ProgressUpdate::Finished => {
-                        let version_id = version_details.id.clone();
-                        download_finished_state = Some(Ok(version_id));
+                     ProgressUpdate::Finished => {
+                         let version_id = version_details.id();
+                         download_finished_state = Some(Ok(version_id));
                     }
                     ProgressUpdate::Error(e) => {
                         download_finished_state = Some(Err(e));
@@ -425,6 +449,52 @@ impl App {
             self.refresh_instances();
         }
 
+        // 3b. Process Modpack Import state changes
+        let mut import_finished_state = None;
+        if let AppState::ImportingModpackProgress { ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut logs, ref mut rx } = self.state {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ProgressUpdate::Started { total: t, message: msg } => {
+                        *total = t;
+                        *completed = 0;
+                        *message = msg.clone();
+                        logs.push(format!("Import: {}", msg));
+                    }
+                    ProgressUpdate::Progress { completed: c, total: t, current_file: f } => {
+                        *completed = c;
+                        *total = t;
+                        *current_file = f.clone();
+                        if c % 5 == 0 || c == t {
+                            logs.push(format!("[{}/{}] Imported {}", c, t, f));
+                        }
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        *message = msg.clone();
+                        logs.push(msg);
+                    }
+                    ProgressUpdate::Finished => {
+                        import_finished_state = Some(Ok(()));
+                    }
+                    ProgressUpdate::Error(e) => {
+                        import_finished_state = Some(Err(e));
+                    }
+                }
+            }
+        }
+
+        if let Some(res) = import_finished_state {
+            self.state = AppState::Normal;
+            match res {
+                Ok(_) => {
+                    self.status_message = Some(("Modpack imported successfully!".to_string(), false));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Import failed: {}", e), true));
+                }
+            }
+            self.refresh_instances();
+        }
+
         // 4. Process Game Log streams and termination status
         if let AppState::GameRunning { ref mut logs, ref mut rx_logs, ref mut rx_status, ref mut status, ref mut crash_analysis, ref mut scroll_offset, auto_scroll, ref instance_id, .. } = self.state {
             while let Ok(line) = rx_logs.try_recv() {
@@ -454,10 +524,11 @@ impl App {
                 let game_dir = self.config.game_dir.clone();
                 let details_clone = details.clone();
 
+                let details_id = details.id();
                 let details_json_path = game_dir
                     .join("versions")
-                    .join(&details.id)
-                    .join(format!("{}.json", details.id));
+                    .join(&details_id)
+                    .join(format!("{}.json", details_id));
                 if let Some(parent) = details_json_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -969,6 +1040,10 @@ impl App {
                 Span::styled("   [E]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), 
                 Span::raw(" Edit Settings"),
             ]),
+            Line::from(vec![
+                Span::styled(" [P]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Import Modpack (.mrpack)"),
+            ]),
         ];
         
         let help_p = Paragraph::new(help_text)
@@ -1159,6 +1234,72 @@ impl App {
                 f.render_widget(input_p, inner_layout[2]);
 
                 let help = Paragraph::new("Press [Enter] to Next, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::ImportingModpackPath => {
+                let area = self.get_centered_rect(60, 20, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Import Modpack (.mrpack) ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter absolute path to .mrpack file:"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Next, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::ImportingModpackId { path: _ } => {
+                let area = self.get_centered_rect(50, 20, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Confirm Instance ID ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter desired instance ID/folder name:"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Import, [Esc] to Cancel")
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(help, inner_layout[3]);
@@ -1480,6 +1621,51 @@ impl App {
                 f.render_widget(log_list, chunks[2]);
             }
 
+            AppState::ImportingModpackProgress { completed, total, ref current_file, ref message, ref logs, .. } => {
+                f.render_widget(Clear, size);
+                
+                let block = Block::default()
+                    .title(" Importing Modpack ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, size);
+
+                let inner = size.inner(&ratatui::layout::Margin { horizontal: 3, vertical: 2 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), 
+                        Constraint::Length(3), 
+                        Constraint::Min(4),    
+                    ])
+                    .split(inner);
+
+                let pct = if total > 0 { (completed * 100) / total } else { 0 };
+                let title_text = format!("{} Progress: {}% ({}/{})", message, pct, completed, total);
+                let current_p = Paragraph::new(format!("{}\nFile: {}", title_text, current_file))
+                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+                f.render_widget(current_p, chunks[0]);
+
+                let inner_width = chunks[1].width as usize - 2;
+                let filled_chars = if total > 0 { (completed * inner_width) / total } else { 0 };
+                let mut bar = String::new();
+                for _ in 0..filled_chars { bar.push('█'); }
+                for _ in filled_chars..inner_width { bar.push('░'); }
+                let bar_p = Paragraph::new(bar)
+                    .style(Style::default().fg(Color::Cyan))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
+                f.render_widget(bar_p, chunks[1]);
+
+                let log_items: Vec<ListItem> = logs.iter().rev().take(15).map(|log| {
+                    ListItem::new(log.as_str()).style(Style::default().fg(Color::Rgb(150, 150, 160)))
+                }).collect();
+
+                let log_list = List::new(log_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Modpack Import Log "));
+                f.render_widget(log_list, chunks[2]);
+            }
+
             AppState::BackupsMenu { instance_idx, ref backups, ref backups_list_state } => {
                 let area = self.get_centered_rect(70, 70, size);
                 f.render_widget(Clear, area);
@@ -1517,6 +1703,103 @@ impl App {
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
                 f.render_widget(help_p, chunks[1]);
             }
+            AppState::ChoosingModLoader { instance_id: _, ref instance_name, ref game_version, ref loader_options, ref loader_list_state } => {
+                let area = self.get_centered_rect(60, 60, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Mod Loader for '{}' (MC {}) ", instance_name, game_version))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = loader_options.iter().map(|opt| {
+                    ListItem::new(format!("  {}", opt)).style(Style::default().fg(Color::White))
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Select a Loader ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = loader_list_state.clone();
+                f.render_stateful_widget(list, chunks[0], &mut state);
+
+                let help_p = Paragraph::new("Press [Enter] to Select, [Esc] to Skip (Vanilla)")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+            }
+
+            AppState::ModManager { instance_idx, ref mods, ref mod_list_state } => {
+                let area = self.get_centered_rect(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" Mod Manager — {} ({} mods) ", inst_name, mods.len()))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(4),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = mods.iter().map(|m| {
+                    let status = if m.enabled { "✓" } else { "✗" };
+                    let status_color = if m.enabled { Color::Green } else { Color::Red };
+                    let line = Line::from(vec![
+                        Span::styled(format!(" [{}] ", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(&m.metadata.name, Style::default().fg(Color::White)),
+                        Span::styled(format!("  v{}", m.metadata.version), Style::default().fg(Color::Rgb(140, 140, 160))),
+                    ]);
+                    ListItem::new(line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Installed Mods ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                let mut state = mod_list_state.clone();
+                f.render_stateful_widget(list, chunks[0], &mut state);
+
+                // Show description of selected mod
+                let desc_text = if let Some(idx) = mod_list_state.selected() {
+                    if let Some(m) = mods.get(idx) {
+                        format!("{}\n{}", m.metadata.name, m.metadata.description.as_deref().unwrap_or("No description available."))
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    "No mod selected.".to_string()
+                };
+
+                let desc_p = Paragraph::new(desc_text)
+                    .style(Style::default().fg(Color::Rgb(180, 180, 200)))
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(border_color)));
+                f.render_widget(desc_p, chunks[1]);
+            }
+
             AppState::GameRunning { .. } => {}
         }
     }
@@ -1607,6 +1890,79 @@ impl App {
                 }
             }
 
+            AppState::ImportingModpackPath => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let path_str = self.version_search_query.trim().to_string();
+                        let path = std::path::PathBuf::from(&path_str);
+                        if path.exists() && path.is_file() {
+                            self.version_search_query.clear();
+                            // Derive default ID from file stem
+                            let default_id = path.file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("imported-pack")
+                                .to_string();
+                            self.version_search_query = default_id;
+                            self.state = AppState::ImportingModpackId { path };
+                        } else {
+                            self.status_message = Some((format!("File does not exist: {}", path_str), true));
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::ImportingModpackId { ref path } => {
+                let path = path.clone();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let custom_id = self.version_search_query.trim().to_string();
+                        if !custom_id.is_empty() {
+                            self.version_search_query.clear();
+                            
+                            let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                            let game_dir = self.config.game_dir.clone();
+                            let path_clone = path.clone();
+                            let id_clone = custom_id.clone();
+                            
+                            tokio::spawn(async move {
+                                let _ = Instance::import_mrpack(&game_dir, &path_clone, &id_clone, &tx).await;
+                            });
+
+                            self.state = AppState::ImportingModpackProgress {
+                                completed: 0,
+                                total: 100,
+                                current_file: String::new(),
+                                message: "Starting modpack import...".to_string(),
+                                logs: Vec::new(),
+                                rx,
+                            };
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
             AppState::CreatingInstanceName => {
                 match key.code {
                     KeyCode::Esc => {
@@ -1673,24 +2029,63 @@ impl App {
                         if let Some(idx) = self.version_list_state.selected() {
                             if let Some(brief) = self.filtered_version_briefs.get(idx).cloned() {
                                 let id_clone = id.clone();
-                                match Instance::create(&self.config.game_dir, &id_clone, name, &brief.id) {
-                                    Ok(inst) => {
-                                        self.config.active_instance = Some(inst.id.clone());
-                                        let _ = self.config.save();
-                                        
-                                        if !self.local_versions.contains(&brief.id) {
-                                            self.start_download_flow(brief).await;
+                                let name_clone = name.clone();
+                                let game_version = brief.id.clone();
+
+                                // Build loader options asynchronously
+                                let mut loader_options = vec!["Vanilla".to_string()];
+
+                                // Fetch available Fabric loaders
+                                if let Ok(fabric_loaders) = self.api_client.fetch_fabric_loaders(&game_version).await {
+                                    for fl in fabric_loaders.iter().take(5) {
+                                        let label = if fl.loader.stable {
+                                            format!("Fabric {} (stable)", fl.loader.version)
                                         } else {
-                                            self.state = AppState::Normal;
-                                            self.status_message = Some((format!("Created instance '{}'!", id_clone), false));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.state = AppState::Normal;
-                                        self.status_message = Some((format!("Failed to create instance: {}", e), true));
+                                            format!("Fabric {}", fl.loader.version)
+                                        };
+                                        loader_options.push(label);
                                     }
                                 }
-                                self.refresh_instances();
+
+                                // Fetch Forge versions for this MC version
+                                if let Ok(forge_index) = self.api_client.fetch_forge_versions().await {
+                                    for fv in forge_index.versions.iter().take(100) {
+                                        // Check if this Forge version targets our MC version
+                                        if fv.requires.iter().any(|r| r.uid == "net.minecraft" && r.equals == game_version) {
+                                            let label = if fv.recommended {
+                                                format!("Forge {} (recommended)", fv.version)
+                                            } else {
+                                                format!("Forge {}", fv.version)
+                                            };
+                                            loader_options.push(label);
+                                        }
+                                    }
+                                }
+
+                                // Fetch NeoForge versions for this MC version
+                                if let Ok(neoforge_index) = self.api_client.fetch_neoforge_versions().await {
+                                    for nv in neoforge_index.versions.iter().take(100) {
+                                        if nv.requires.iter().any(|r| r.uid == "net.minecraft" && r.equals == game_version) {
+                                            let label = if nv.recommended {
+                                                format!("NeoForge {} (recommended)", nv.version)
+                                            } else {
+                                                format!("NeoForge {}", nv.version)
+                                            };
+                                            loader_options.push(label);
+                                        }
+                                    }
+                                }
+
+                                let mut loader_list_state = ListState::default();
+                                loader_list_state.select(Some(0));
+
+                                self.state = AppState::ChoosingModLoader {
+                                    instance_id: id_clone,
+                                    instance_name: name_clone,
+                                    game_version,
+                                    loader_options,
+                                    loader_list_state,
+                                };
                                 self.version_search_query.clear();
                             }
                         }
@@ -1925,7 +2320,221 @@ impl App {
                 }
             }
 
-            AppState::Downloading { .. } | AppState::SyncingInstanceMods { .. } => {}
+            AppState::ChoosingModLoader { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, mut loader_list_state } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // Skip mod loader → create vanilla instance
+                            match Instance::create(&self.config.game_dir, &instance_id, &instance_name, &game_version) {
+                                Ok(inst) => {
+                                    self.config.active_instance = Some(inst.id.clone());
+                                    let _ = self.config.save();
+                                    self.refresh_instances();
+
+                                    if !self.local_versions.contains(&game_version) {
+                                        if let Some(brief) = self.filtered_version_briefs.iter().find(|b| b.id == game_version).cloned() {
+                                            self.start_download_flow(brief).await;
+                                        } else {
+                                            self.state = AppState::Normal;
+                                            self.status_message = Some((format!("Created vanilla instance '{}'!", instance_id), false));
+                                        }
+                                    } else {
+                                        self.state = AppState::Normal;
+                                        self.status_message = Some((format!("Created vanilla instance '{}'!", instance_id), false));
+                                    }
+                                }
+                                Err(e) => {
+                                    self.status_message = Some((format!("Failed: {}", e), true));
+                                }
+                            }
+                            self.version_search_query.clear();
+                        }
+                        KeyCode::Up => {
+                            let selected = loader_list_state.selected().unwrap_or(0);
+                            if selected > 0 {
+                                loader_list_state.select(Some(selected - 1));
+                            }
+                            self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                        }
+                        KeyCode::Down => {
+                            let selected = loader_list_state.selected().unwrap_or(0);
+                            if selected + 1 < loader_options.len() {
+                                loader_list_state.select(Some(selected + 1));
+                            }
+                            self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                        }
+                        KeyCode::Enter => {
+                            if let Some(idx) = loader_list_state.selected() {
+                                if let Some(choice) = loader_options.get(idx).cloned() {
+                                    // Determine version_id based on loader choice
+                                    let version_id = if choice == "Vanilla" {
+                                        game_version.clone()
+                                    } else {
+                                        let parts: Vec<&str> = choice.split_whitespace().collect();
+                                        let loader_ver = parts.get(1).copied().unwrap_or("");
+
+                                        if choice.starts_with("Fabric") {
+                                            // Fetch fabric profile and install it
+                                            let version_id = format!("fabric-loader-{}-{}", loader_ver, game_version);
+
+                                            match self.api_client.fetch_fabric_profile(&game_version, loader_ver).await {
+                                                Ok(profile) => {
+                                                    let version_dir = self.config.game_dir
+                                                        .join("versions")
+                                                        .join(&version_id);
+                                                    let _ = std::fs::create_dir_all(&version_dir);
+                                                    let json_path = version_dir.join(format!("{}.json", version_id));
+                                                    if let Ok(json_str) = serde_json::to_string_pretty(&profile) {
+                                                        let _ = std::fs::write(&json_path, json_str);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    self.status_message = Some((format!("Failed to fetch Fabric profile: {}", e), true));
+                                                    self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                                                    return false;
+                                                }
+                                            }
+                                            version_id
+                                        } else {
+                                            // Forge/NeoForge — use Prism meta
+                                            let is_neoforge = choice.starts_with("NeoForge");
+                                            let version_id = if is_neoforge {
+                                                format!("neoforge-{}", loader_ver)
+                                            } else {
+                                                format!("forge-{}", loader_ver)
+                                            };
+
+                                            let profile_result = if is_neoforge {
+                                                self.api_client.fetch_neoforge_profile(loader_ver).await
+                                            } else {
+                                                self.api_client.fetch_forge_profile(loader_ver).await
+                                            };
+
+                                            match profile_result {
+                                                Ok(profile) => {
+                                                    let version_dir = self.config.game_dir
+                                                        .join("versions")
+                                                        .join(&version_id);
+                                                    let _ = std::fs::create_dir_all(&version_dir);
+                                                    let json_path = version_dir.join(format!("{}.json", version_id));
+                                                    if let Ok(json_str) = serde_json::to_string_pretty(&profile) {
+                                                        let _ = std::fs::write(&json_path, json_str);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let loader_name = if is_neoforge { "NeoForge" } else { "Forge" };
+                                                    self.status_message = Some((format!("Failed to fetch {} profile: {}", loader_name, e), true));
+                                                    self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                                                    return false;
+                                                }
+                                            }
+                                            version_id
+                                        }
+                                    };
+
+                                    // Create the instance with the chosen version_id
+                                    match Instance::create(&self.config.game_dir, &instance_id, &instance_name, &version_id) {
+                                        Ok(inst) => {
+                                            self.config.active_instance = Some(inst.id.clone());
+                                            let _ = self.config.save();
+                                            self.refresh_instances();
+
+                                            // Need to download the base game + loader libraries
+                                            let launcher = Launcher::new(self.config.clone());
+                                            match launcher.load_version_details(&version_id) {
+                                                Ok(details) => {
+                                                    let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                                                    let game_dir = self.config.game_dir.clone();
+                                                    tokio::spawn(async move {
+                                                        let downloader = Downloader::new(tx);
+                                                        let _ = downloader.download_version(&game_dir, &details).await;
+                                                    });
+                                                    self.state = AppState::Downloading {
+                                                        completed: 0,
+                                                        total: 100,
+                                                        current_file: String::new(),
+                                                        message: format!("Installing {}...", version_id),
+                                                        logs: Vec::new(),
+                                                        rx,
+                                                        version_details: launcher.load_version_details(&version_id).unwrap(),
+                                                    };
+                                                }
+                                                Err(e) => {
+                                                    self.status_message = Some((format!("Failed to load version details: {}", e), true));
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.status_message = Some((format!("Failed to create instance: {}", e), true));
+                                        }
+                                    }
+                                    self.version_search_query.clear();
+                                } else {
+                                    self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                                }
+                            } else {
+                                self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                            }
+                        }
+                        _ => {
+                            self.state = AppState::ChoosingModLoader { instance_id, instance_name, game_version, loader_options, loader_list_state };
+                        }
+                    }
+                }
+            }
+
+            AppState::ModManager { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::ModManager { instance_idx, mut mods, mut mod_list_state } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            // self.state already Normal
+                        }
+                        KeyCode::Up => {
+                            let selected = mod_list_state.selected().unwrap_or(0);
+                            if selected > 0 {
+                                mod_list_state.select(Some(selected - 1));
+                            }
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        }
+                        KeyCode::Down => {
+                            let selected = mod_list_state.selected().unwrap_or(0);
+                            if selected + 1 < mods.len() {
+                                mod_list_state.select(Some(selected + 1));
+                            }
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            // Toggle enabled/disabled
+                            if let Some(selected) = mod_list_state.selected() {
+                                if let Some(inst) = self.instances.get(instance_idx) {
+                                    if let Some(m) = mods.get_mut(selected) {
+                                        let mods_dir = inst.path.join("mods");
+                                        let old_path = mods_dir.join(&m.filename);
+                                        let new_filename = if m.enabled {
+                                            format!("{}.disabled", m.filename)
+                                        } else {
+                                            m.filename.strip_suffix(".disabled").unwrap_or(&m.filename).to_string()
+                                        };
+                                        let new_path = mods_dir.join(&new_filename);
+                                        if std::fs::rename(&old_path, &new_path).is_ok() {
+                                            m.filename = new_filename;
+                                            m.enabled = !m.enabled;
+                                        }
+                                    }
+                                }
+                            }
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        }
+                        _ => {
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        }
+                    }
+                }
+            }
+
+            AppState::Downloading { .. } | AppState::SyncingInstanceMods { .. } | AppState::ImportingModpackProgress { .. } => {}
         }
         false
     }
@@ -2011,6 +2620,26 @@ impl App {
                                 };
                             }
                         }
+                    }
+                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                        if let Some(idx) = self.instances_list_state.selected() {
+                            if let Some(inst) = self.instances.get(idx) {
+                                let mods = inst.get_mods().unwrap_or_default();
+                                let mut mod_list_state = ListState::default();
+                                if !mods.is_empty() {
+                                    mod_list_state.select(Some(0));
+                                }
+                                self.state = AppState::ModManager {
+                                    instance_idx: idx,
+                                    mods,
+                                    mod_list_state,
+                                };
+                            }
+                        }
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        self.state = AppState::ImportingModpackPath;
+                        self.version_search_query.clear();
                     }
                     _ => {}
                 }

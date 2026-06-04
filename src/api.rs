@@ -153,12 +153,81 @@ pub struct LibraryDownloads {
     pub classifiers: Option<HashMap<String, Artifact>>,
 }
 
+pub fn maven_to_path(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split(':').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let group = parts[0].replace('.', "/");
+    let artifact = parts[1];
+    let version = parts[2];
+    
+    let (classifier, ext) = if parts.len() == 4 {
+        let last = parts[3];
+        if last.contains('@') {
+            let subparts: Vec<&str> = last.split('@').collect();
+            (Some(subparts[0]), subparts[1])
+        } else {
+            (Some(last), "jar")
+        }
+    } else if parts.len() == 3 {
+        if version.contains('@') {
+            let subparts: Vec<&str> = version.split('@').collect();
+            let clean_version = subparts[0];
+            return Some(format!("{}/{}/{}/{}-{}.{}", group, artifact, clean_version, artifact, clean_version, subparts[1]));
+        }
+        (None, "jar")
+    } else {
+        return None;
+    };
+
+    let filename = match classifier {
+        Some(cls) => format!("{}-{}-{}.{}", artifact, version, cls, ext),
+        None => format!("{}-{}.{}", artifact, version, ext),
+    };
+
+    Some(format!("{}/{}/{}/{}", group, artifact, version, filename))
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Library {
     pub name: String,
-    pub downloads: LibraryDownloads,
+    pub downloads: Option<LibraryDownloads>,
     pub rules: Option<Vec<Rule>>,
     pub natives: Option<HashMap<String, String>>,
+    pub url: Option<String>,
+    pub sha1: Option<String>,
+    pub size: Option<u64>,
+}
+
+impl Library {
+    pub fn get_artifact(&self) -> Option<Artifact> {
+        if let Some(ref downloads) = self.downloads {
+            if let Some(ref art) = downloads.artifact {
+                return Some(art.clone());
+            }
+        }
+
+        if let Some(path) = maven_to_path(&self.name) {
+            let sha1 = self.sha1.clone().unwrap_or_default();
+            let size = self.size.unwrap_or(0);
+            let base_url = self.url.as_deref().unwrap_or("https://repo1.maven.org/maven2/");
+            let url = if base_url.ends_with('/') {
+                format!("{}{}", base_url, path)
+            } else {
+                format!("{}/{}", base_url, path)
+            };
+
+            Some(Artifact {
+                path,
+                sha1,
+                size,
+                url,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -191,15 +260,42 @@ pub struct JavaVersion {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionDetails {
-    pub id: String,
-    pub r#type: String,
-    pub mainClass: String,
+    pub id: Option<String>,
+    pub r#type: Option<String>,
+    pub mainClass: Option<String>,
     pub arguments: Option<Arguments>,
     pub minecraftArguments: Option<String>,
     pub libraries: Vec<Library>,
-    pub assetIndex: AssetIndexRef,
-    pub downloads: DownloadsRef,
+    #[serde(rename = "mavenFiles")]
+    pub maven_files: Option<Vec<Library>>,
+    pub assetIndex: Option<AssetIndexRef>,
+    pub downloads: Option<DownloadsRef>,
     pub javaVersion: Option<JavaVersion>,
+    pub inheritsFrom: Option<String>,
+    pub uid: Option<String>,
+    pub version: Option<String>,
+}
+
+impl VersionDetails {
+    pub fn id(&self) -> String {
+        self.id.clone()
+            .or_else(|| {
+                if let (Some(uid), Some(ver)) = (&self.uid, &self.version) {
+                    if uid.contains("forge") {
+                        if uid.contains("neoforged") {
+                            Some(format!("neoforge-{}", ver))
+                        } else {
+                            Some(format!("forge-{}", ver))
+                        }
+                    } else {
+                        Some(ver.clone())
+                    }
+                } else {
+                    self.version.clone()
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 // --- Asset Index Structures ---
@@ -510,5 +606,129 @@ impl ApiClient {
         res.json::<MinecraftProfile>()
             .await
             .map_err(|e| format!("Failed to parse profile response: {}", e))
+    }
+
+    pub async fn fetch_fabric_loaders(&self, game_version: &str) -> Result<Vec<FabricLoaderResponse>, String> {
+        let url = format!("https://meta.fabricmc.net/v2/versions/loader/{}", game_version);
+        self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch Fabric loader versions: {}", e))?
+            .json::<Vec<FabricLoaderResponse>>()
+            .await
+            .map_err(|e| format!("Failed to parse Fabric loader versions: {}", e))
+    }
+
+    pub async fn fetch_fabric_profile(&self, game_version: &str, loader_version: &str) -> Result<VersionDetails, String> {
+        let url = format!("https://meta.fabricmc.net/v2/versions/loader/{}/{}/profile/json", game_version, loader_version);
+        self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch Fabric profile: {}", e))?
+            .json::<VersionDetails>()
+            .await
+            .map_err(|e| format!("Failed to parse Fabric profile: {}", e))
+    }
+
+    pub async fn fetch_forge_versions(&self) -> Result<PrismMetaIndex, String> {
+        let url = "https://meta.prismlauncher.org/v1/net.minecraftforge/index.json";
+        self.client.get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch Forge versions: {}", e))?
+            .json::<PrismMetaIndex>()
+            .await
+            .map_err(|e| format!("Failed to parse Forge versions: {}", e))
+    }
+
+    pub async fn fetch_neoforge_versions(&self) -> Result<PrismMetaIndex, String> {
+        let url = "https://meta.prismlauncher.org/v1/net.neoforged/index.json";
+        self.client.get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch NeoForge versions: {}", e))?
+            .json::<PrismMetaIndex>()
+            .await
+            .map_err(|e| format!("Failed to parse NeoForge versions: {}", e))
+    }
+
+    pub async fn fetch_forge_profile(&self, version: &str) -> Result<VersionDetails, String> {
+        let url = format!("https://meta.prismlauncher.org/v1/net.minecraftforge/{}.json", version);
+        self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch Forge profile: {}", e))?
+            .json::<VersionDetails>()
+            .await
+            .map_err(|e| format!("Failed to parse Forge profile: {}", e))
+    }
+
+    pub async fn fetch_neoforge_profile(&self, version: &str) -> Result<VersionDetails, String> {
+        let url = format!("https://meta.prismlauncher.org/v1/net.neoforged/{}.json", version);
+        self.client.get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch NeoForge profile: {}", e))?
+            .json::<VersionDetails>()
+            .await
+            .map_err(|e| format!("Failed to parse NeoForge profile: {}", e))
+    }
+}
+
+// --- Fabric response models ---
+#[derive(Deserialize, Debug, Clone)]
+pub struct FabricLoader {
+    pub version: String,
+    pub stable: bool,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct FabricLoaderResponse {
+    pub loader: FabricLoader,
+}
+
+// --- Prism Launcher Meta Response models (Forge/NeoForge) ---
+#[derive(Deserialize, Debug, Clone)]
+pub struct PrismMetaRequire {
+    pub equals: String,
+    pub uid: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PrismMetaVersion {
+    pub version: String,
+    pub recommended: bool,
+    pub requires: Vec<PrismMetaRequire>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PrismMetaIndex {
+    pub name: String,
+    pub uid: String,
+    pub versions: Vec<PrismMetaVersion>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_maven_to_path() {
+        assert_eq!(
+            maven_to_path("net.fabricmc:fabric-loader:0.15.0"),
+            Some("net/fabricmc/fabric-loader/0.15.0/fabric-loader-0.15.0.jar".to_string())
+        );
+        assert_eq!(
+            maven_to_path("org.ow2.asm:asm-commons:6.2"),
+            Some("org/ow2/asm/asm-commons/6.2/asm-commons-6.2.jar".to_string())
+        );
+        assert_eq!(
+            maven_to_path("net.minecraftforge:forge:1.14.4-28.2.30:launcher"),
+            Some("net/minecraftforge/forge/1.14.4-28.2.30/forge-1.14.4-28.2.30-launcher.jar".to_string())
+        );
+        assert_eq!(
+            maven_to_path("invalid_coords"),
+            None
+        );
     }
 }

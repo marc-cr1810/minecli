@@ -104,6 +104,12 @@ enum InstanceAction {
         version: String,
         #[arg(short, long)]
         name: Option<String>,
+        /// Optional mod loader (e.g. fabric, forge, neoforge)
+        #[arg(long)]
+        loader: Option<String>,
+        /// Optional mod loader version
+        #[arg(long)]
+        loader_version: Option<String>,
     },
     /// Delete an instance
     Delete {
@@ -119,6 +125,24 @@ enum InstanceAction {
         #[arg(short, long)]
         backup: String, // backup filename or timestamp
     },
+    /// List all backups for an instance
+    ListBackups {
+        id: String,
+    },
+    /// List mods for an instance
+    ListMods {
+        id: String,
+    },
+    /// Enable a mod in an instance
+    EnableMod {
+        id: String,
+        filename: String,
+    },
+    /// Disable a mod in an instance
+    DisableMod {
+        id: String,
+        filename: String,
+    },
     /// Synchronize/download declarative mods for an instance
     Sync {
         id: String,
@@ -132,6 +156,14 @@ enum InstanceAction {
         /// Set a specific JRE major version to download and use (e.g. 8, 17, 21. Use 0 to revert to auto-detection)
         #[arg(long)]
         java_version: Option<u32>,
+    },
+    /// Import a Modrinth .mrpack modpack file as a new instance
+    ImportPack {
+        /// Path to the .mrpack file
+        path: String,
+        /// Instance ID to use
+        #[arg(short, long)]
+        id: Option<String>,
     },
 }
 
@@ -291,19 +323,42 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
         .join(version_id)
         .join(format!("{}.json", version_id));
 
-    println!("Fetching details for Minecraft version {}...", version_id);
-    let manifest = api.fetch_version_manifest().await?;
-    let brief = manifest.versions.iter()
-        .find(|v| v.id == version_id)
-        .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang manifest.", version_id))?;
+    let details = if version_json_path.exists() {
+        let launcher = Launcher::new(config.clone());
+        launcher.load_version_details(version_id)?
+    } else {
+        if version_id.starts_with("fabric-loader-") {
+            let rest = version_id.strip_prefix("fabric-loader-").unwrap();
+            let (loader_ver, game_ver) = rest.split_once('-')
+                .ok_or_else(|| format!("Invalid Fabric version ID format: {}", version_id))?;
+            println!("Fetching Fabric profile (Loader: {}, Game: {})...", loader_ver, game_ver);
+            api.fetch_fabric_profile(game_ver, loader_ver).await?
+        } else if version_id.starts_with("forge-") {
+            let loader_ver = version_id.strip_prefix("forge-").unwrap();
+            println!("Fetching Forge profile (Version: {})...", loader_ver);
+            api.fetch_forge_profile(loader_ver).await?
+        } else if version_id.starts_with("neoforge-") {
+            let loader_ver = version_id.strip_prefix("neoforge-").unwrap();
+            println!("Fetching NeoForge profile (Version: {})...", loader_ver);
+            api.fetch_neoforge_profile(loader_ver).await?
+        } else {
+            println!("Fetching details for Minecraft version {}...", version_id);
+            let manifest = api.fetch_version_manifest().await?;
+            let brief = manifest.versions.iter()
+                .find(|v| v.id == version_id)
+                .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang manifest.", version_id))?;
 
-    let details = api.fetch_version_details(&brief.url).await?;
+            api.fetch_version_details(&brief.url).await?
+        }
+    };
 
-    if let Some(parent) = version_json_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if !version_json_path.exists() {
+        if let Some(parent) = version_json_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = serde_json::to_string_pretty(&details).map_err(|e| e.to_string())?;
+        std::fs::write(&version_json_path, content).map_err(|e| e.to_string())?;
     }
-    let content = serde_json::to_string_pretty(&details).map_err(|e| e.to_string())?;
-    std::fs::write(&version_json_path, content).map_err(|e| e.to_string())?;
 
     let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
     let downloader = Downloader::new(tx);
@@ -465,6 +520,92 @@ fn handle_settings_command(action: SettingsAction) -> Result<(), String> {
     }
     Ok(())
 }
+async fn resolve_and_setup_loader(
+    api: &ApiClient,
+    game_dir: &std::path::Path,
+    game_version: &str,
+    loader_name: &str,
+    loader_version_opt: Option<String>,
+) -> Result<String, String> {
+    let loader_lower = loader_name.to_lowercase();
+    if loader_lower == "fabric" {
+        let loaders = api.fetch_fabric_loaders(game_version).await?;
+        let loader_ver = if let Some(v) = loader_version_opt {
+            if !loaders.iter().any(|l| l.loader.version == v) {
+                return Err(format!("Fabric loader version '{}' not found for Minecraft {}.", v, game_version));
+            }
+            v
+        } else {
+            let selected = loaders.iter()
+                .find(|l| l.loader.stable)
+                .or_else(|| loaders.first())
+                .ok_or_else(|| format!("No Fabric loaders found for Minecraft {}.", game_version))?;
+            selected.loader.version.clone()
+        };
+
+        let version_id = format!("fabric-loader-{}-{}", loader_ver, game_version);
+        println!("Fetching Fabric profile for loader {}...", loader_ver);
+        let profile = api.fetch_fabric_profile(game_version, &loader_ver).await?;
+        
+        let version_dir = game_dir.join("versions").join(&version_id);
+        std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
+        let json_path = version_dir.join(format!("{}.json", version_id));
+        let json_str = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+        std::fs::write(&json_path, json_str).map_err(|e| e.to_string())?;
+
+        Ok(version_id)
+    } else if loader_lower == "forge" || loader_lower == "neoforge" {
+        let is_neoforge = loader_lower == "neoforge";
+        println!("Fetching {} version index...", if is_neoforge { "NeoForge" } else { "Forge" });
+        let index = if is_neoforge {
+            api.fetch_neoforge_versions().await?
+        } else {
+            api.fetch_forge_versions().await?
+        };
+
+        // Filter versions matching game version
+        let matching: Vec<_> = index.versions.iter().filter(|v| {
+            v.requires.iter().any(|req| req.uid == "net.minecraft" && req.equals == game_version)
+        }).collect();
+
+        if matching.is_empty() {
+            return Err(format!("No {} versions found matching Minecraft version {}.", if is_neoforge { "NeoForge" } else { "Forge" }, game_version));
+        }
+
+        let selected_ver = if let Some(v) = loader_version_opt {
+            if !matching.iter().any(|m| m.version == v) {
+                return Err(format!("{} version '{}' not found/supported for Minecraft {}.", if is_neoforge { "NeoForge" } else { "Forge" }, v, game_version));
+            }
+            v
+        } else {
+            let rec = matching.iter().find(|m| m.recommended).or_else(|| matching.first());
+            rec.unwrap().version.clone()
+        };
+
+        let version_id = if is_neoforge {
+            format!("neoforge-{}", selected_ver)
+        } else {
+            format!("forge-{}", selected_ver)
+        };
+
+        println!("Fetching {} profile for version {}...", if is_neoforge { "NeoForge" } else { "Forge" }, selected_ver);
+        let profile = if is_neoforge {
+            api.fetch_neoforge_profile(&selected_ver).await?
+        } else {
+            api.fetch_forge_profile(&selected_ver).await?
+        };
+
+        let version_dir = game_dir.join("versions").join(&version_id);
+        std::fs::create_dir_all(&version_dir).map_err(|e| e.to_string())?;
+        let json_path = version_dir.join(format!("{}.json", version_id));
+        let json_str = serde_json::to_string_pretty(&profile).map_err(|e| e.to_string())?;
+        std::fs::write(&json_path, json_str).map_err(|e| e.to_string())?;
+
+        Ok(version_id)
+    } else {
+        Err(format!("Unsupported mod loader '{}'. Supported: fabric, forge, neoforge", loader_name))
+    }
+}
 
 async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
     let mut config = Config::load();
@@ -481,21 +622,26 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 }
             }
         }
-        InstanceAction::Create { id, version, name } => {
+        InstanceAction::Create { id, version, name, loader, loader_version } => {
             let name_str = name.unwrap_or_else(|| format!("{} Profile", id));
-            
             let api = ApiClient::new();
-            println!("Validating Minecraft version '{}'...", version);
-            let manifest = api.fetch_version_manifest().await?;
-            if !manifest.versions.iter().any(|v| v.id == version) {
-                return Err(format!("Version '{}' not found in Mojang version manifest.", version));
-            }
+            
+            let resolved_version = if let Some(ref l) = loader {
+                resolve_and_setup_loader(&api, &config.game_dir, &version, l, loader_version).await?
+            } else {
+                println!("Validating Minecraft version '{}'...", version);
+                let manifest = api.fetch_version_manifest().await?;
+                if !manifest.versions.iter().any(|v| v.id == version) {
+                    return Err(format!("Version '{}' not found in Mojang version manifest.", version));
+                }
+                version.clone()
+            };
 
-            let inst = Instance::create(&config.game_dir, &id, &name_str, &version)?;
+            let inst = Instance::create(&config.game_dir, &id, &name_str, &resolved_version)?;
             config.active_instance = Some(inst.id.clone());
             config.save()?;
             
-            println!("Created instance '{}' ({} - {}) and set it as active.", id, name_str, version);
+            println!("Created instance '{}' ({} - {}) and set it as active.", id, name_str, resolved_version);
             println!("Run `minecli launch {}` to play.", id);
         }
         InstanceAction::Delete { id } => {
@@ -518,6 +664,41 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             println!("Restoring backup '{}' for instance '{}'...", backup, id);
             inst.restore(&backup)?;
             println!("Instance restored successfully!");
+        }
+        InstanceAction::ListBackups { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let backups = inst.list_backups();
+            if backups.is_empty() {
+                println!("No backups found for instance '{}'.", id);
+            } else {
+                println!("Available backups for instance '{}':", id);
+                for backup in backups {
+                    println!(" - {}", backup);
+                }
+            }
+        }
+        InstanceAction::ListMods { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let mods = inst.get_mods()?;
+            if mods.is_empty() {
+                println!("No mods found for instance '{}'.", id);
+            } else {
+                println!("Mods for instance '{}':", id);
+                for m in mods {
+                    let status = if m.enabled { "ENABLED" } else { "DISABLED" };
+                    println!(" - {:<35} [{}] (Version: {})", m.filename, status, m.metadata.version);
+                }
+            }
+        }
+        InstanceAction::EnableMod { id, filename } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            inst.enable_mod(&filename)?;
+            println!("Enabled mod '{}' in instance '{}'.", filename, id);
+        }
+        InstanceAction::DisableMod { id, filename } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            inst.disable_mod(&filename)?;
+            println!("Disabled mod '{}' in instance '{}'.", filename, id);
         }
         InstanceAction::Sync { id } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
@@ -580,6 +761,58 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 println!("Saved settings for instance '{}'.", id);
             } else {
                 println!("No changes specified. Use `--java-path` or `--java-version`.");
+            }
+        }
+        InstanceAction::ImportPack { path, id } => {
+            let pack_path = std::path::PathBuf::from(&path);
+            if !pack_path.exists() {
+                return Err(format!("File not found: {}", path));
+            }
+
+            let custom_id = id.unwrap_or_else(|| {
+                pack_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("imported-pack")
+                    .to_string()
+            });
+
+            println!("Importing modpack '{}' as instance '{}'...", path, custom_id);
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(100);
+
+            let game_dir = config.game_dir.clone();
+            let pack_path_clone = pack_path.clone();
+            let id_clone = custom_id.clone();
+
+            let handle = tokio::spawn(async move {
+                Instance::import_mrpack(&game_dir, &pack_path_clone, &id_clone, &tx).await
+            });
+
+            // Print progress
+            while let Some(update) = rx.recv().await {
+                match update {
+                    ProgressUpdate::Message(msg) => println!("  {}", msg),
+                    ProgressUpdate::Started { total, message } => println!("  {} ({} files)", message, total),
+                    ProgressUpdate::Progress { completed, total, current_file } => {
+                        println!("  [{}/{}] {}", completed, total, current_file);
+                    }
+                    ProgressUpdate::Finished => break,
+                    ProgressUpdate::Error(e) => {
+                        eprintln!("  Error: {}", e);
+                    }
+                }
+            }
+
+            match handle.await {
+                Ok(Ok(inst)) => {
+                    println!("Successfully imported modpack as instance '{}'.", inst.id);
+                    println!("  Version: {}", inst.config.version);
+                    if let Some(mods) = &inst.config.mods {
+                        println!("  Mods: {} declared", mods.len());
+                    }
+                }
+                Ok(Err(e)) => return Err(format!("Import failed: {}", e)),
+                Err(e) => return Err(format!("Import task panicked: {}", e)),
             }
         }
     }

@@ -5,6 +5,52 @@ use std::collections::{HashMap, HashSet};
 use serde::{Serialize, Deserialize};
 use crate::downloader::ProgressUpdate;
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ModMetadata {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstanceMod {
+    pub filename: String,
+    pub enabled: bool,
+    pub metadata: ModMetadata,
+}
+
+// --- Modrinth mrpack index models ---
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct MrPackFileHashes {
+    pub sha1: String,
+    pub sha256: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct MrPackFile {
+    pub path: String,
+    pub hashes: MrPackFileHashes,
+    pub downloads: Vec<String>,
+    #[serde(rename = "fileSize")]
+    pub file_size: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone)]
+pub struct MrPackIndex {
+    #[serde(rename = "formatVersion")]
+    pub format_version: u32,
+    pub name: String,
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    pub summary: Option<String>,
+    pub files: Vec<MrPackFile>,
+    pub dependencies: HashMap<String, String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(untagged)]
 pub enum ModValue {
@@ -345,6 +391,286 @@ impl Instance {
         list.reverse(); // Newest backups first
         list
     }
+
+    pub fn get_mods(&self) -> Result<Vec<InstanceMod>, String> {
+        let mods_dir = self.path.join("mods");
+        if !mods_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut list = Vec::new();
+        if let Ok(entries) = fs::read_dir(mods_dir) {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type() {
+                    if file_type.is_file() {
+                        let filename = entry.file_name().to_string_lossy().to_string();
+                        let enabled = !filename.ends_with(".disabled");
+                        if filename.ends_with(".jar") || filename.ends_with(".jar.disabled") {
+                            let metadata = read_mod_metadata(&entry.path()).unwrap_or_else(|_| {
+                                let clean_name = filename.strip_suffix(".disabled").unwrap_or(&filename).strip_suffix(".jar").unwrap_or(&filename);
+                                ModMetadata {
+                                    id: clean_name.to_string(),
+                                    name: clean_name.to_string(),
+                                    version: "unknown".to_string(),
+                                    description: None,
+                                }
+                            });
+                            list.push(InstanceMod {
+                                filename,
+                                enabled,
+                                metadata,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        list.sort_by(|a, b| a.metadata.name.to_lowercase().cmp(&b.metadata.name.to_lowercase()));
+        Ok(list)
+    }
+
+    pub fn enable_mod(&self, filename: &str) -> Result<(), String> {
+        let mods_dir = self.path.join("mods");
+        let old_path = mods_dir.join(filename);
+        if !old_path.exists() {
+            return Err(format!("Mod file '{}' not found.", filename));
+        }
+        if !filename.ends_with(".disabled") {
+            return Ok(()); // Already enabled
+        }
+        let new_filename = filename.strip_suffix(".disabled").unwrap();
+        let new_path = mods_dir.join(new_filename);
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| format!("Failed to enable mod: {}", e))?;
+        Ok(())
+    }
+
+    pub fn disable_mod(&self, filename: &str) -> Result<(), String> {
+        let mods_dir = self.path.join("mods");
+        let old_path = mods_dir.join(filename);
+        if !old_path.exists() {
+            return Err(format!("Mod file '{}' not found.", filename));
+        }
+        if filename.ends_with(".disabled") {
+            return Ok(()); // Already disabled
+        }
+        let new_filename = format!("{}.disabled", filename);
+        let new_path = mods_dir.join(new_filename);
+        std::fs::rename(&old_path, &new_path)
+            .map_err(|e| format!("Failed to disable mod: {}", e))?;
+        Ok(())
+    }
+
+    pub async fn import_mrpack(
+        game_dir: &Path,
+        pack_path: &Path,
+        custom_id: &str,
+        progress_tx: &tokio::sync::mpsc::Sender<ProgressUpdate>,
+    ) -> Result<Self, String> {
+        let file = File::open(pack_path).map_err(|e| e.to_string())?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+        // 1. Read modrinth.index.json
+        let index: MrPackIndex = {
+            let mut index_file = archive.by_name("modrinth.index.json")
+                .map_err(|_| "Invalid .mrpack: missing modrinth.index.json".to_string())?;
+            let mut index_content = String::new();
+            index_file.read_to_string(&mut index_content).map_err(|e| e.to_string())?;
+            serde_json::from_str(&index_content)
+                .map_err(|e| format!("Failed to parse modrinth.index.json: {}", e))?
+        };
+
+        // Determine mod loader and version
+        let mc_version = index.dependencies.get("minecraft")
+            .ok_or_else(|| "Missing minecraft dependency in modpack".to_string())?
+            .clone();
+
+        // Target version ID for instance
+        let version_id = if let Some(fabric_version) = index.dependencies.get("fabric-loader") {
+            format!("fabric-loader-{}-{}", fabric_version, mc_version)
+        } else if let Some(forge_version) = index.dependencies.get("forge") {
+            format!("forge-{}", forge_version)
+        } else if let Some(neoforge_version) = index.dependencies.get("neoforge") {
+            format!("neoforge-{}", neoforge_version)
+        } else {
+            mc_version.clone()
+        };
+
+        // Create instance folder
+        let instances_dir = game_dir.join("instances");
+        let instance_path = instances_dir.join(custom_id);
+        if instance_path.exists() {
+            return Err(format!("Instance directory '{}' already exists", custom_id));
+        }
+        fs::create_dir_all(&instance_path).map_err(|e| e.to_string())?;
+
+        // 2. Extract overrides/
+        let _ = progress_tx.send(ProgressUpdate::Message("Extracting overrides...".to_string())).await;
+        let archive_len = archive.len();
+        for i in 0..archive_len {
+            let mut zip_file = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = zip_file.name().to_string();
+            if name.starts_with("overrides/") {
+                let rel_path = name.strip_prefix("overrides/").unwrap();
+                if rel_path.is_empty() {
+                    continue;
+                }
+                let dest_path = instance_path.join(rel_path);
+                if zip_file.is_dir() {
+                    fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
+                } else {
+                    if let Some(parent) = dest_path.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let mut outfile = File::create(&dest_path).map_err(|e| e.to_string())?;
+                    io::copy(&mut zip_file, &mut outfile).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        // 3. Download pack files
+        let client = reqwest::Client::new();
+        let total_files = index.files.len();
+        let _ = progress_tx.send(ProgressUpdate::Started {
+            total: total_files,
+            message: format!("Downloading {} modpack files...", total_files),
+        }).await;
+
+        let mut instance_mods = HashMap::new();
+
+        for (idx, pack_file) in index.files.into_iter().enumerate() {
+            let dest_path = instance_path.join(&pack_file.path);
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+
+            let filename = dest_path.file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("download")
+                .to_string();
+
+            let mut downloaded = false;
+            for url in &pack_file.downloads {
+                let _ = progress_tx.send(ProgressUpdate::Progress {
+                    completed: idx + 1,
+                    total: total_files,
+                    current_file: filename.clone(),
+                }).await;
+
+                if crate::downloader::Downloader::verify_sha1(&dest_path, &pack_file.hashes.sha1) {
+                    downloaded = true;
+                    break;
+                }
+
+                if let Ok(res) = client.get(url).send().await {
+                    if res.status().is_success() {
+                        if let Ok(bytes) = res.bytes().await {
+                            if fs::write(&dest_path, &bytes).is_ok() {
+                                if crate::downloader::Downloader::verify_sha1(&dest_path, &pack_file.hashes.sha1) {
+                                    downloaded = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !downloaded {
+                return Err(format!("Failed to download file: {}", pack_file.path));
+            }
+
+            if pack_file.path.starts_with("mods/") {
+                if let Some(first_url) = pack_file.downloads.first() {
+                    instance_mods.insert(filename, ModValue::Detailed {
+                        url: first_url.clone(),
+                        sha1: Some(pack_file.hashes.sha1.clone()),
+                    });
+                }
+            }
+        }
+
+        // Create the instance configuration
+        let inst = Self {
+            id: custom_id.to_string(),
+            path: instance_path,
+            config: InstanceConfig {
+                name: index.name,
+                version: version_id,
+                jvm_args: None,
+                pre_launch: None,
+                post_exit: None,
+                mods: Some(instance_mods),
+                java_path: None,
+                java_version: None,
+            },
+        };
+
+        inst.save()?;
+        let _ = progress_tx.send(ProgressUpdate::Finished).await;
+
+        Ok(inst)
+    }
+}
+
+pub fn read_mod_metadata(jar_path: &Path) -> Result<ModMetadata, String> {
+    let file = File::open(jar_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    // Try fabric.mod.json
+    if let Ok(mut fabric_file) = archive.by_name("fabric.mod.json") {
+        let mut content = String::new();
+        if fabric_file.read_to_string(&mut content).is_ok() {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                let id = json["id"].as_str().unwrap_or("").to_string();
+                let name = json["name"].as_str().map(|s| s.to_string()).unwrap_or_else(|| id.clone());
+                let version = json["version"].as_str().unwrap_or("unknown").to_string();
+                let description = json["description"].as_str().map(|s| s.to_string());
+                if !id.is_empty() {
+                    return Ok(ModMetadata { id, name, version, description });
+                }
+            }
+        }
+    }
+
+    // Try mods.toml or neoforge.mods.toml under META-INF
+    for name in &["META-INF/mods.toml", "META-INF/neoforge.mods.toml"] {
+        if let Ok(mut toml_file) = archive.by_name(name) {
+            let mut content = String::new();
+            if toml_file.read_to_string(&mut content).is_ok() {
+                if let Ok(toml_val) = toml::from_str::<toml::Value>(&content) {
+                    if let Some(mods_array) = toml_val.get("mods").and_then(|m| m.as_array()) {
+                        if let Some(first_mod) = mods_array.get(0) {
+                            let id = first_mod.get("modId").and_then(|v| v.as_str())
+                                .or_else(|| first_mod.get("id").and_then(|v| v.as_str()))
+                                .unwrap_or("")
+                                .to_string();
+                            let name = first_mod.get("displayName").and_then(|v| v.as_str())
+                                .or_else(|| first_mod.get("name").and_then(|v| v.as_str()))
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| id.clone());
+                            let version = first_mod.get("version").and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let description = first_mod.get("description").and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if !id.is_empty() {
+                                return Ok(ModMetadata { id, name, version, description });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let filename = jar_path.file_name().and_then(|s| s.to_str()).unwrap_or("unknown.jar");
+    let clean_name = filename.strip_suffix(".disabled").unwrap_or(filename).strip_suffix(".jar").unwrap_or(filename);
+    Ok(ModMetadata {
+        id: clean_name.to_string(),
+        name: clean_name.to_string(),
+        version: "unknown".to_string(),
+        description: None,
+    })
 }
 
 fn zip_dir_recursive(
@@ -401,4 +727,61 @@ fn unzip_to_dir(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_read_mod_metadata_fabric() {
+        let temp_path = std::env::temp_dir().join("minecli_test_fabric_mod.jar");
+        {
+            let file = File::create(&temp_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("fabric.mod.json", zip::write::FileOptions::default()).unwrap();
+            zip.write_all(br#"{
+                "id": "testmod",
+                "name": "Test Mod",
+                "version": "1.0.0",
+                "description": "A nice fabric mod"
+            }"#).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let meta = read_mod_metadata(&temp_path).unwrap();
+        assert_eq!(meta.id, "testmod");
+        assert_eq!(meta.name, "Test Mod");
+        assert_eq!(meta.version, "1.0.0");
+        assert_eq!(meta.description, Some("A nice fabric mod".to_string()));
+
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn test_read_mod_metadata_forge() {
+        let temp_path = std::env::temp_dir().join("minecli_test_forge_mod.jar");
+        {
+            let file = File::create(&temp_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/mods.toml", zip::write::FileOptions::default()).unwrap();
+            zip.write_all(br#"
+[[mods]]
+modId = "testforge"
+displayName = "Test Forge Mod"
+version = "2.3.4"
+description = "A forge mod"
+"#).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let meta = read_mod_metadata(&temp_path).unwrap();
+        assert_eq!(meta.id, "testforge");
+        assert_eq!(meta.name, "Test Forge Mod");
+        assert_eq!(meta.version, "2.3.4");
+        assert_eq!(meta.description, Some("A forge mod".to_string()));
+
+        let _ = fs::remove_file(temp_path);
+    }
 }

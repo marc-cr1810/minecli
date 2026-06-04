@@ -48,10 +48,71 @@ impl Launcher {
         let content = fs::read_to_string(json_path)
             .map_err(|e| format!("Failed to read version details: {}", e))?;
 
-        let details: VersionDetails = serde_json::from_str(&content)
+        let mut details: VersionDetails = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse version JSON: {}", e))?;
 
+        if let Some(maven_libs) = details.maven_files.take() {
+            details.libraries.extend(maven_libs);
+        }
+
+        if let Some(ref parent_id) = details.inheritsFrom {
+            let parent_details = self.load_version_details(parent_id)?;
+            details = self.merge_version_details(details, parent_details);
+        }
+
         Ok(details)
+    }
+
+    fn merge_version_details(&self, mut child: VersionDetails, parent: VersionDetails) -> VersionDetails {
+        // Libraries: prepend parent's libraries
+        let mut merged_libraries = parent.libraries;
+        merged_libraries.extend(child.libraries);
+        child.libraries = merged_libraries;
+
+        // Asset Index
+        if child.assetIndex.is_none() {
+            child.assetIndex = parent.assetIndex;
+        }
+
+        // Downloads
+        if child.downloads.is_none() {
+            child.downloads = parent.downloads;
+        }
+
+        // Java Version
+        if child.javaVersion.is_none() {
+            child.javaVersion = parent.javaVersion;
+        }
+
+        // Arguments
+        match (&child.arguments, &parent.arguments) {
+            (Some(child_args), Some(parent_args)) => {
+                let mut merged_game = parent_args.game.clone();
+                merged_game.extend(child_args.game.clone());
+                let mut merged_jvm = parent_args.jvm.clone();
+                merged_jvm.extend(child_args.jvm.clone());
+                child.arguments = Some(crate::api::Arguments {
+                    game: merged_game,
+                    jvm: merged_jvm,
+                });
+            }
+            (None, Some(parent_args)) => {
+                child.arguments = Some(parent_args.clone());
+            }
+            _ => {}
+        }
+
+        // Legacy minecraftArguments
+        if child.minecraftArguments.is_none() {
+            child.minecraftArguments = parent.minecraftArguments;
+        }
+
+        // Main Class
+        if child.mainClass.is_none() {
+            child.mainClass = parent.mainClass;
+        }
+
+        child
     }
 
     fn build_classpath(&self, details: &VersionDetails) -> Result<String, String> {
@@ -65,17 +126,19 @@ impl Launcher {
                 }
             }
 
-            if let Some(ref art) = lib.downloads.artifact {
+            if let Some(art) = lib.get_artifact() {
                 let lib_path = libraries_dir.join(&art.path);
                 classpath_entries.push(lib_path);
             }
         }
 
         // Add client jar itself
+        let details_id = details.id();
+        let jar_version_id = details.inheritsFrom.as_ref().unwrap_or(&details_id);
         let client_jar = self.config.game_dir
             .join("versions")
-            .join(&details.id)
-            .join(format!("{}.jar", details.id));
+            .join(jar_version_id)
+            .join(format!("{}.jar", jar_version_id));
         classpath_entries.push(client_jar);
 
         let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
@@ -115,7 +178,7 @@ impl Launcher {
         vars.insert("version_name", version_id.to_string());
         vars.insert("game_directory", instance.path.to_string_lossy().to_string());
         vars.insert("assets_root", self.config.game_dir.join("assets").to_string_lossy().to_string());
-        vars.insert("assets_index_name", details.assetIndex.id.clone());
+        vars.insert("assets_index_name", details.assetIndex.as_ref().map(|a| a.id.clone()).unwrap_or_default());
         vars.insert("auth_uuid", format_uuid_with_hyphens(&account.uuid));
         
         let token = if let Some(ref ms) = account.microsoft_auth {
@@ -130,7 +193,7 @@ impl Launcher {
             AccountType::Offline => "legacy".to_string(),
         };
         vars.insert("user_type", user_type);
-        vars.insert("version_type", details.r#type.clone());
+        vars.insert("version_type", details.r#type.clone().unwrap_or_else(|| "release".to_string()));
         vars.insert("natives_directory", natives_dir.to_string_lossy().to_string());
         vars.insert("classpath", classpath);
         vars.insert("user_properties", "{}".to_string());
@@ -302,7 +365,7 @@ impl Launcher {
         cmd.args(&final_jvm_args);
         
         // Main Class
-        cmd.arg(&details.mainClass);
+        cmd.arg(details.mainClass.as_deref().unwrap_or("net.minecraft.client.main.Main"));
 
         // Pass game args
         cmd.args(&game_args);
