@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use reqwest::Client;
 
-const CLIENT_ID: &str = "00000000402B5328"; // Official Minecraft Launcher Client ID
+const CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb"; // Prism Launcher Client ID (allows Device Code OAuth)
 
 // --- Mojang Version Manifest Structs ---
 
@@ -41,9 +41,18 @@ pub struct RuleOS {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RuleFeatures {
+    #[serde(rename = "is_demo_user")]
+    pub is_demo_user: Option<bool>,
+    #[serde(rename = "has_custom_resolution")]
+    pub has_custom_resolution: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Rule {
     pub action: String,
     pub os: Option<RuleOS>,
+    pub features: Option<RuleFeatures>,
 }
 
 impl Rule {
@@ -75,6 +84,18 @@ impl Rule {
                     if arch != current_arch {
                         return false;
                     }
+                }
+            }
+        }
+        if let Some(ref features_rule) = self.features {
+            if let Some(is_demo) = features_rule.is_demo_user {
+                if is_demo {
+                    return false;
+                }
+            }
+            if let Some(has_custom_res) = features_rule.has_custom_resolution {
+                if !has_custom_res {
+                    return false;
                 }
             }
         }
@@ -150,8 +171,15 @@ pub struct AssetIndexRef {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ClientArtifact {
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct DownloadsRef {
-    pub client: Artifact,
+    pub client: ClientArtifact,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]

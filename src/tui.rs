@@ -66,6 +66,8 @@ pub struct App {
     version_list_state: ListState,
     filtered_version_briefs: Vec<VersionBrief>,
     version_search_query: String,
+    filter_releases: bool,
+    filter_snapshots: bool,
     
     account_list_state: ListState,
     settings_list_state: ListState,
@@ -90,6 +92,8 @@ impl App {
             version_list_state: ListState::default(),
             filtered_version_briefs: Vec::new(),
             version_search_query: String::new(),
+            filter_releases: true,
+            filter_snapshots: true,
             account_list_state: ListState::default(),
             settings_list_state: ListState::default(),
             status_message: None,
@@ -114,7 +118,11 @@ impl App {
         if let Some(ref manifest) = self.version_manifest {
             let query = self.version_search_query.to_lowercase();
             self.filtered_version_briefs = manifest.versions.iter()
-                .filter(|v| v.id.to_lowercase().contains(&query) || v.r#type.to_lowercase().contains(&query))
+                .filter(|v| {
+                    let matches_search = v.id.to_lowercase().contains(&query) || v.r#type.to_lowercase().contains(&query);
+                    let matches_type = (self.filter_releases && v.r#type == "release") || (self.filter_snapshots && v.r#type == "snapshot");
+                    matches_search && matches_type
+                })
                 .cloned()
                 .collect();
             
@@ -365,7 +373,7 @@ impl App {
         }
     }
 
-    fn run_minecraft(&mut self) {
+    async fn run_minecraft(&mut self) {
         let version_id = match self.get_selected_version_id() {
             Some(v) => v,
             None => {
@@ -392,7 +400,7 @@ impl App {
         println!("==================================================");
 
         let launcher = Launcher::new(self.config.clone());
-        let launch_res = launcher.launch(&version_id, &account);
+        let launch_res = launcher.launch(&version_id, &account).await;
 
         println!("\n==================================================");
         if let Err(e) = launch_res {
@@ -610,7 +618,10 @@ impl App {
             .split(inner);
 
         // A. Search Bar
-        let search_text = format!("Search: {}", self.version_search_query);
+        let release_status = if self.filter_releases { "● Releases (F1)" } else { "○ Releases (F1)" };
+        let snapshot_status = if self.filter_snapshots { "● Snapshots (F2)" } else { "○ Snapshots (F2)" };
+        
+        let search_text = format!(" Search: {:<30} | {} | {}", self.version_search_query, release_status, snapshot_status);
         let search_p = Paragraph::new(search_text)
             .style(Style::default().fg(Color::White))
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
@@ -704,7 +715,7 @@ impl App {
 
         // B. Quick Actions Help Panel
         let help_text = vec![
-            Line::from(vec![Span::styled(" [O]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), Span::raw(" Add Offline Profile       "), Span::styled("[M]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" Add Microsoft Online Account")]),
+            Line::from(vec![Span::styled(" [A]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" Add Account               "), Span::styled("[O]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), Span::raw(" Add Offline Profile")]),
             Line::from(vec![Span::styled(" [Enter]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)), Span::raw(" Select Profile Active     "), Span::styled("[X]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)), Span::raw(" Delete Profile")]),
         ];
         
@@ -817,7 +828,7 @@ impl App {
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
-                    .title(" Microsoft Online Login ")
+                    .title(" Add Account ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(Color::Cyan));
@@ -854,7 +865,7 @@ impl App {
                     .wrap(Wrap { trim: true });
                 f.render_widget(poll_p, chunks[3]);
 
-                let cancel_p = Paragraph::new("Press [Esc] to Cancel Microsoft Login Flow")
+                let cancel_p = Paragraph::new("Press [Esc] to Cancel Login Flow")
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Red));
                 f.render_widget(cancel_p, chunks[4]);
@@ -998,7 +1009,7 @@ impl App {
 
                     // Launch triggers
                     KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('L') if self.active_tab == Tab::Dashboard => {
-                        self.run_minecraft();
+                        self.run_minecraft().await;
                     }
 
                     // Tab specific inputs
@@ -1089,6 +1100,14 @@ impl App {
             
             Tab::Versions => {
                 match key.code {
+                    KeyCode::F(1) => {
+                        self.filter_releases = !self.filter_releases;
+                        self.filter_versions();
+                    }
+                    KeyCode::F(2) => {
+                        self.filter_snapshots = !self.filter_snapshots;
+                        self.filter_versions();
+                    }
                     KeyCode::Up => {
                         let selected = self.version_list_state.selected().unwrap_or(0);
                         if selected > 0 {
@@ -1160,7 +1179,7 @@ impl App {
                     KeyCode::Char('o') | KeyCode::Char('O') => {
                         self.start_offline_account_flow();
                     }
-                    KeyCode::Char('m') | KeyCode::Char('M') => {
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
                         self.start_microsoft_account_flow();
                     }
                     KeyCode::Char('x') | KeyCode::Char('X') => {

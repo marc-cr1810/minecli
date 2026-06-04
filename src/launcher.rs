@@ -96,7 +96,7 @@ impl Launcher {
         result
     }
 
-    pub fn prepare_launch(&self, version_id: &str, account: &Account) -> Result<Command, String> {
+    pub async fn prepare_launch(&self, version_id: &str, account: &Account) -> Result<Command, String> {
         let details = self.load_version_details(version_id)?;
 
         let classpath = self.build_classpath(&details)?;
@@ -110,7 +110,7 @@ impl Launcher {
         vars.insert("game_directory", self.config.game_dir.to_string_lossy().to_string());
         vars.insert("assets_root", self.config.game_dir.join("assets").to_string_lossy().to_string());
         vars.insert("assets_index_name", details.assetIndex.id.clone());
-        vars.insert("auth_uuid", account.uuid.clone());
+        vars.insert("auth_uuid", format_uuid_with_hyphens(&account.uuid));
         
         let token = if let Some(ref ms) = account.microsoft_auth {
             ms.access_token.clone()
@@ -128,6 +128,17 @@ impl Launcher {
         vars.insert("natives_directory", natives_dir.to_string_lossy().to_string());
         vars.insert("classpath", classpath);
         vars.insert("user_properties", "{}".to_string());
+        vars.insert("resolution_width", "854".to_string());
+        vars.insert("resolution_height", "480".to_string());
+        vars.insert("clientid", "minecli".to_string());
+        let xuid = if let Some(ref ms) = account.microsoft_auth {
+            extract_xuid_from_token(&ms.access_token).unwrap_or_else(|| "dummy".to_string())
+        } else {
+            "dummy".to_string()
+        };
+        vars.insert("auth_xuid", xuid);
+        vars.insert("launcher_name", "minecli".to_string());
+        vars.insert("launcher_version", "0.1.0".to_string());
 
         let mut jvm_args = Vec::new();
         let mut game_args = Vec::new();
@@ -144,11 +155,24 @@ impl Launcher {
                         if Rule::evaluate(rules) {
                             match value {
                                 ArgumentValueList::Single(s) => {
-                                    jvm_args.push(self.replace_placeholders(s, &vars));
+                                    let replaced = self.replace_placeholders(s, &vars);
+                                    if !replaced.contains("${") {
+                                        jvm_args.push(replaced);
+                                    }
                                 }
                                 ArgumentValueList::Many(list) => {
+                                    let mut replaced_list = Vec::new();
+                                    let mut has_unreplaced = false;
                                     for s in list {
-                                        jvm_args.push(self.replace_placeholders(s, &vars));
+                                        let replaced = self.replace_placeholders(s, &vars);
+                                        if replaced.contains("${") {
+                                            has_unreplaced = true;
+                                            break;
+                                        }
+                                        replaced_list.push(replaced);
+                                    }
+                                    if !has_unreplaced {
+                                        jvm_args.extend(replaced_list);
                                     }
                                 }
                             }
@@ -188,11 +212,24 @@ impl Launcher {
                         if Rule::evaluate(rules) {
                             match value {
                                 ArgumentValueList::Single(s) => {
-                                    game_args.push(self.replace_placeholders(s, &vars));
+                                    let replaced = self.replace_placeholders(s, &vars);
+                                    if !replaced.contains("${") {
+                                        game_args.push(replaced);
+                                    }
                                 }
                                 ArgumentValueList::Many(list) => {
+                                    let mut replaced_list = Vec::new();
+                                    let mut has_unreplaced = false;
                                     for s in list {
-                                        game_args.push(self.replace_placeholders(s, &vars));
+                                        let replaced = self.replace_placeholders(s, &vars);
+                                        if replaced.contains("${") {
+                                            has_unreplaced = true;
+                                            break;
+                                        }
+                                        replaced_list.push(replaced);
+                                    }
+                                    if !has_unreplaced {
+                                        game_args.extend(replaced_list);
                                     }
                                 }
                             }
@@ -208,7 +245,14 @@ impl Launcher {
         }
 
         // 3. Construct command
-        let mut cmd = Command::new(&self.config.java_path);
+        let java_exe = if self.config.java_path == std::path::Path::new("java") || !self.config.java_path.exists() {
+            let java_version = details.javaVersion.as_ref().map(|jv| jv.majorVersion).unwrap_or(17);
+            crate::java::install_java_if_needed(&self.config.game_dir, java_version).await?
+        } else {
+            std::path::PathBuf::from(&self.config.java_path)
+        };
+
+        let mut cmd = Command::new(java_exe);
         cmd.current_dir(&self.config.game_dir);
         
         // Pass JVM args
@@ -223,13 +267,14 @@ impl Launcher {
         Ok(cmd)
     }
 
-    pub fn launch(&self, version_id: &str, account: &Account) -> Result<(), String> {
-        let mut cmd = self.prepare_launch(version_id, account)?;
+    pub async fn launch(&self, version_id: &str, account: &Account) -> Result<(), String> {
+        let mut cmd = self.prepare_launch(version_id, account).await?;
         
         // Redirect stdout/stderr to parent process so standard terminal logging works
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
 
+        println!("Launch command: {:?}", cmd);
         let mut child = cmd.spawn()
             .map_err(|e| format!("Failed to spawn Java process: {}. Is Java installed and configured correctly?", e))?;
         
@@ -242,4 +287,69 @@ impl Launcher {
 
         Ok(())
     }
+}
+
+fn format_uuid_with_hyphens(uuid: &str) -> String {
+    let clean = uuid.replace('-', "");
+    if clean.len() == 32 {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &clean[0..8],
+            &clean[8..12],
+            &clean[12..16],
+            &clean[16..20],
+            &clean[20..32]
+        )
+    } else {
+        uuid.to_string()
+    }
+}
+
+fn extract_xuid_from_token(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() > 1 {
+        let payload_b64 = parts[1];
+        // Decode base64url manually
+        let mut s = payload_b64.replace('-', "+").replace('_', "/");
+        while s.len() % 4 != 0 {
+            s.push('=');
+        }
+        
+        let mut table = [0u8; 256];
+        for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+            table[c as usize] = i as u8;
+        }
+        
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        if len % 4 == 0 {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < len {
+                let b0 = table[bytes[i] as usize] as u32;
+                let b1 = table[bytes[i+1] as usize] as u32;
+                let b2 = if bytes[i+2] == b'=' { 0 } else { table[bytes[i+2] as usize] as u32 };
+                let b3 = if bytes[i+3] == b'=' { 0 } else { table[bytes[i+3] as usize] as u32 };
+                
+                let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
+                
+                out.push(((triple >> 16) & 0xff) as u8);
+                if bytes[i+2] != b'=' {
+                    out.push(((triple >> 8) & 0xff) as u8);
+                }
+                if bytes[i+3] != b'=' {
+                    out.push((triple & 0xff) as u8);
+                }
+                i += 4;
+            }
+            if let Ok(json_str) = String::from_utf8(out) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(xuid) = val.get("xuid") {
+                        return xuid.as_str().map(|s| s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

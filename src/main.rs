@@ -3,6 +3,8 @@ mod api;
 mod downloader;
 mod launcher;
 mod tui;
+mod java;
+
 
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -32,22 +34,99 @@ enum Commands {
         /// Minecraft version ID (e.g., 1.20.4, 1.12.2)
         version: String,
 
-        /// Offline username to run with (ignored if online is active)
+        /// Username to run with (offline or online username override)
         #[arg(short, long)]
         username: Option<String>,
 
-        /// Force online login via Microsoft OAuth Device Code
+        /// Launch in offline mode
         #[arg(short, long)]
-        online: bool,
+        offline: bool,
 
         /// Do not check or update files, launch immediately
-        #[arg(short, long)]
+        #[arg(long)]
         offline_mode: bool,
     },
     /// List all locally downloaded versions
-    List,
+    List {
+        /// Filter local versions by name
+        #[arg(short, long)]
+        search: Option<String>,
+    },
     /// List all remote versions available from Mojang
-    ListRemote,
+    ListRemote {
+        /// Show only official releases
+        #[arg(short, long)]
+        release: bool,
+
+        /// Show only snapshots
+        #[arg(short, long)]
+        snapshot: bool,
+
+        /// Filter versions by name
+        #[arg(short, long)]
+        search: Option<String>,
+
+        /// Limit the number of printed results (default: 40)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+    /// Download and verify all game files for a version without launching
+    Download {
+        /// Minecraft version ID (e.g., 1.20.4)
+        version: String,
+    },
+    /// Manage accounts (add, delete, list, select)
+    Accounts {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
+    /// View or edit settings
+    Settings {
+        #[command(subcommand)]
+        action: SettingsAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum AccountAction {
+    /// List all configured accounts
+    List,
+    /// Set the active account
+    Select {
+        /// Username or UUID of the account
+        name_or_uuid: String,
+    },
+    /// Add a new offline profile
+    AddOffline {
+        /// Desired username
+        username: String,
+    },
+    /// Add a new Microsoft online account (starts device code flow)
+    Add,
+    /// Remove an account profile
+    Remove {
+        /// UUID or username of the account to remove
+        name_or_uuid: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum SettingsAction {
+    /// Show current settings
+    Show,
+    /// Set the game directory path
+    SetGameDir {
+        path: String,
+    },
+    /// Set the Java executable path
+    SetJava {
+        path: String,
+    },
+    /// Set JVM arguments (pass quotes)
+    SetJvmArgs {
+        #[arg(allow_hyphen_values = true)]
+        args: String,
+    },
 }
 
 #[tokio::main]
@@ -55,18 +134,26 @@ async fn main() {
     let cli = Cli::parse();
     
     match cli.command {
-        Some(Commands::Launch { version, username, online, offline_mode }) => {
-            if let Err(e) = handle_cli_launch(version, username, online, offline_mode).await {
+        Some(Commands::Launch { version, username, offline, offline_mode }) => {
+            if let Err(e) = handle_cli_launch(version, username, !offline, offline_mode).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        Some(Commands::List) => {
+        Some(Commands::List { search }) => {
             let config = Config::load();
             let launcher = Launcher::new(config);
-            let versions = launcher.get_available_local_versions();
+            let mut versions = launcher.get_available_local_versions();
+            if let Some(ref q) = search {
+                let q_lower = q.to_lowercase();
+                versions.retain(|v| v.to_lowercase().contains(&q_lower));
+            }
             if versions.is_empty() {
-                println!("No local versions downloaded. Run `minecli` to select and download one.");
+                if search.is_some() {
+                    println!("No local versions match the search filter.");
+                } else {
+                    println!("No local versions downloaded. Run `minecli` to select and download one.");
+                }
             } else {
                 println!("Downloaded Minecraft versions:");
                 for v in versions {
@@ -74,24 +161,66 @@ async fn main() {
                 }
             }
         }
-        Some(Commands::ListRemote) => {
+        Some(Commands::ListRemote { release, snapshot, search, limit }) => {
             println!("Fetching available Minecraft versions...");
             let api = ApiClient::new();
             match api.fetch_version_manifest().await {
                 Ok(manifest) => {
-                    println!("{:<18} | {:<10} | {}", "Version ID", "Type", "Release Time");
-                    println!("{}", "-".repeat(50));
-                    for v in manifest.versions.iter().take(40) {
-                        println!("{:<18} | {:<10} | {}", v.id, v.r#type, v.releaseTime);
+                    let mut filtered_versions = manifest.versions;
+                    
+                    // Filter by type: if either release or snapshot is set (or both)
+                    if release || snapshot {
+                        filtered_versions.retain(|v| {
+                            (release && v.r#type == "release") || (snapshot && v.r#type == "snapshot")
+                        });
                     }
-                    if manifest.versions.len() > 40 {
-                        println!("... and {} more. Launch with `minecli launch <version>` to play.", manifest.versions.len() - 40);
+                    
+                    // Filter by search query
+                    if let Some(ref q) = search {
+                        let q_lower = q.to_lowercase();
+                        filtered_versions.retain(|v| v.id.to_lowercase().contains(&q_lower));
+                    }
+                    
+                    let total_count = filtered_versions.len();
+                    let print_limit = limit.unwrap_or(40);
+                    let display_list: Vec<_> = filtered_versions.iter().take(print_limit).collect();
+                    
+                    if display_list.is_empty() {
+                        println!("No remote versions match the specified filters.");
+                    } else {
+                        println!("{:<18} | {:<10} | {}", "Version ID", "Type", "Release Time");
+                        println!("{}", "-".repeat(50));
+                        for v in &display_list {
+                            println!("{:<18} | {:<10} | {}", v.id, v.r#type, v.releaseTime);
+                        }
+                        if total_count > print_limit {
+                            println!("... and {} more. Launch with `minecli launch <version>` to play.", total_count - print_limit);
+                        }
                     }
                 }
                 Err(e) => {
                     eprintln!("Failed to fetch remote versions: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Some(Commands::Download { version }) => {
+            let config = Config::load();
+            if let Err(e) = download_version_files(&config, &version).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Accounts { action }) => {
+            if let Err(e) = handle_accounts_command(action).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Settings { action }) => {
+            if let Err(e) = handle_settings_command(action) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
         }
         None => {
@@ -104,6 +233,191 @@ async fn main() {
     }
 }
 
+async fn download_version_files(config: &Config, version_id: &str) -> Result<(), String> {
+    let api = ApiClient::new();
+    let version_json_path = config.game_dir
+        .join("versions")
+        .join(version_id)
+        .join(format!("{}.json", version_id));
+
+    println!("Fetching details for Minecraft version {}...", version_id);
+    let manifest = api.fetch_version_manifest().await?;
+    let brief = manifest.versions.iter()
+        .find(|v| v.id == version_id)
+        .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang manifest.", version_id))?;
+
+    let details = api.fetch_version_details(&brief.url).await?;
+
+    // Save details locally
+    if let Some(parent) = version_json_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = serde_json::to_string_pretty(&details).map_err(|e| e.to_string())?;
+    std::fs::write(&version_json_path, content).map_err(|e| e.to_string())?;
+
+    // Download version assets & libraries
+    let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
+    let downloader = Downloader::new(tx);
+    let game_dir = config.game_dir.clone();
+
+    tokio::spawn(async move {
+        let _ = downloader.download_version(&game_dir, &details).await;
+    });
+
+    // Simple CLI progress indicator
+    while let Some(update) = rx.recv().await {
+        match update {
+            ProgressUpdate::Started { total: _, message } => {
+                println!("\n\x1b[33m→ {}\x1b[0m", message);
+            }
+            ProgressUpdate::Progress { completed, total, current_file } => {
+                print!("\r[\x1b[36m{}/{}\x1b[0m] Downloading: {}                     ", completed, total, current_file);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            ProgressUpdate::Message(msg) => {
+                println!("\n\x1b[32m✔ {}\x1b[0m", msg);
+            }
+            ProgressUpdate::Finished => {
+                println!("\n\x1b[32m✔ Download and integrity checks complete!\x1b[0m");
+            }
+            ProgressUpdate::Error(e) => {
+                return Err(format!("Download failed: {}", e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
+    let mut config = Config::load();
+    match action {
+        AccountAction::List => {
+            if config.accounts.is_empty() {
+                println!("No accounts configured. Use the `accounts add-offline` subcommand or TUI.");
+            } else {
+                println!("Configured Accounts:");
+                for acc in &config.accounts {
+                    let active_marker = if config.active_account_uuid.as_deref() == Some(&acc.uuid) { " (ACTIVE)" } else { "" };
+                    let acc_type = match acc.account_type {
+                        AccountType::Offline => "Offline",
+                        AccountType::Microsoft => "Microsoft",
+                    };
+                    println!(" - {} [{}]{}", acc.username, acc_type, active_marker);
+                }
+            }
+        }
+        AccountAction::Select { name_or_uuid } => {
+            let acc = config.accounts.iter().find(|a| a.username == name_or_uuid || a.uuid == name_or_uuid).cloned();
+            if let Some(account) = acc {
+                config.active_account_uuid = Some(account.uuid.clone());
+                config.save()?;
+                println!("Set active account to: {} ({})", account.username, account.uuid);
+            } else {
+                return Err(format!("Account '{}' not found.", name_or_uuid));
+            }
+        }
+        AccountAction::AddOffline { username } => {
+            let uuid = Uuid::new_v4().simple().to_string();
+            let account = Account {
+                uuid,
+                username: username.clone(),
+                account_type: AccountType::Offline,
+                microsoft_auth: None,
+            };
+            config.add_account(account);
+            println!("Successfully added offline profile for: {}", username);
+        }
+        AccountAction::Add => {
+            let api = ApiClient::new();
+            let dev_code = api.request_device_code().await?;
+            println!("To log in, open a web browser and navigate to:");
+            println!("  \x1b[36m\x1b[4m{}\x1b[0m", dev_code.verification_uri);
+            println!("Enter the code below to authorize this launcher:");
+            println!("  \x1b[1m\x1b[32m{}\x1b[0m", dev_code.user_code);
+            println!("Waiting for authentication...");
+
+            let poll_interval = std::time::Duration::from_secs(dev_code.interval.max(1));
+            let mut expires_in = dev_code.expires_in;
+
+            while expires_in > 0 {
+                tokio::time::sleep(poll_interval).await;
+                expires_in = expires_in.saturating_sub(poll_interval.as_secs());
+
+                match api.poll_token(&dev_code.device_code).await {
+                    Ok(Some(token_res)) => {
+                        print!("Exchanging tokens with Mojang... ");
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                        
+                        let mc_res = api.login_with_microsoft(&token_res.access_token).await?;
+                        let profile = api.fetch_profile(&mc_res.access_token).await?;
+                        
+                        let account = Account {
+                            uuid: profile.id,
+                            username: profile.name,
+                            account_type: AccountType::Microsoft,
+                            microsoft_auth: Some(MicrosoftAuth {
+                                access_token: mc_res.access_token,
+                                refresh_token: token_res.refresh_token,
+                                expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(mc_res.expires_in as i64)),
+                            }),
+                        };
+                        
+                        println!("Success!");
+                        println!("Logged in online as: {}", account.username);
+                        config.add_account(account);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(format!("Authentication failed: {}", e));
+                    }
+                }
+            }
+        }
+        AccountAction::Remove { name_or_uuid } => {
+            let acc = config.accounts.iter().find(|a| a.username == name_or_uuid || a.uuid == name_or_uuid).cloned();
+            if let Some(account) = acc {
+                config.remove_account(&account.uuid);
+                println!("Removed account profile: {}", account.username);
+            } else {
+                return Err(format!("Account '{}' not found.", name_or_uuid));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_settings_command(action: SettingsAction) -> Result<(), String> {
+    let mut config = Config::load();
+    match action {
+        SettingsAction::Show => {
+            println!("Launcher Settings:");
+            println!("  Game Directory:       {}", config.game_dir.display());
+            println!("  Java Executable Path: {}", config.java_path.display());
+            println!("  JVM Extra Arguments:  {}", config.jvm_args.join(" "));
+        }
+        SettingsAction::SetGameDir { path } => {
+            config.game_dir = std::path::PathBuf::from(path.clone());
+            config.save()?;
+            println!("Successfully set game directory to: {}", path);
+        }
+        SettingsAction::SetJava { path } => {
+            config.java_path = std::path::PathBuf::from(path.clone());
+            config.save()?;
+            println!("Successfully set Java executable path to: {}", path);
+        }
+        SettingsAction::SetJvmArgs { args } => {
+            config.jvm_args = args.split_whitespace().map(|s| s.to_string()).collect();
+            config.save()?;
+            println!("Successfully set JVM arguments to: {}", args);
+        }
+    }
+    Ok(())
+}
+
 async fn handle_cli_launch(
     version_id: String,
     username_override: Option<String>,
@@ -114,54 +428,96 @@ async fn handle_cli_launch(
     let api = ApiClient::new();
 
     // 1. Resolve Account
-    let account = if force_online {
-        // Authenticate Online
-        println!("Microsoft Online login requested.");
-        let mut active_account = None;
+    let account = if !force_online {
+        // Resolve Offline Account
+        let username = username_override
+            .or_else(|| config.get_active_account().map(|a| a.username.clone()))
+            .unwrap_or_else(|| "Player".to_string());
 
-        // Try to find cached Microsoft Account
+        // Find existing offline account
+        let mut resolved_acc = None;
         for acc in &config.accounts {
-            if acc.account_type == AccountType::Microsoft {
-                active_account = Some(acc.clone());
+            if acc.username == username && acc.account_type == AccountType::Offline {
+                resolved_acc = Some(acc.clone());
                 break;
             }
         }
 
-        match active_account {
+        match resolved_acc {
+            Some(acc) => acc,
+            None => {
+                let uuid = Uuid::new_v4().simple().to_string();
+                let acc = Account {
+                    uuid,
+                    username,
+                    account_type: AccountType::Offline,
+                    microsoft_auth: None,
+                };
+                config.add_account(acc.clone());
+                acc
+            }
+        }
+    } else {
+        // Resolve Online / Active Account (default behavior)
+        let mut target_account = None;
+        if let Some(ref acc) = config.get_active_account() {
+            if acc.account_type == AccountType::Microsoft {
+                target_account = Some((*acc).clone());
+            }
+        }
+        if target_account.is_none() {
+            target_account = config.accounts.iter().find(|a| a.account_type == AccountType::Microsoft).cloned();
+        }
+        if target_account.is_none() {
+            if let Some(ref acc) = config.get_active_account() {
+                if acc.account_type == AccountType::Offline {
+                    target_account = Some((*acc).clone());
+                }
+            }
+        }
+
+        match target_account {
             Some(mut acc) => {
-                // Check if token is expired, refresh if needed
-                if let Some(ref auth) = acc.microsoft_auth {
-                    let is_expired = auth.expires_at.map(|exp| exp < chrono::Utc::now()).unwrap_or(true);
-                    if is_expired {
-                        println!("Session expired. Refreshing Microsoft tokens...");
-                        match api.refresh_token(&auth.refresh_token).await {
-                            Ok(token_res) => {
-                                match api.login_with_microsoft(&token_res.access_token).await {
-                                    Ok(mc_res) => {
-                                        let updated_auth = MicrosoftAuth {
-                                            access_token: mc_res.access_token,
-                                            refresh_token: token_res.refresh_token,
-                                            expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(mc_res.expires_in as i64)),
-                                        };
-                                        acc.microsoft_auth = Some(updated_auth);
-                                        config.add_account(acc.clone());
-                                    }
-                                    Err(e) => {
-                                        return Err(format!("Failed to log in with refreshed token: {}", e));
+                if acc.account_type == AccountType::Microsoft {
+                    // Check if token is expired, refresh if needed
+                    if let Some(ref auth) = acc.microsoft_auth {
+                        let is_expired = auth.expires_at.map(|exp| exp < chrono::Utc::now()).unwrap_or(true);
+                        if is_expired {
+                            println!("Session expired. Refreshing Microsoft tokens...");
+                            match api.refresh_token(&auth.refresh_token).await {
+                                Ok(token_res) => {
+                                    match api.login_with_microsoft(&token_res.access_token).await {
+                                        Ok(mc_res) => {
+                                            let updated_auth = MicrosoftAuth {
+                                                access_token: mc_res.access_token,
+                                                refresh_token: token_res.refresh_token,
+                                                expires_at: Some(chrono::Utc::now() + chrono::Duration::seconds(mc_res.expires_in as i64)),
+                                            };
+                                            acc.microsoft_auth = Some(updated_auth);
+                                            config.add_account(acc.clone());
+                                        }
+                                        Err(e) => {
+                                            return Err(format!("Failed to log in with refreshed token: {}", e));
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                return Err(format!("Failed to refresh MS token (re-authentication required): {}", e));
+                                Err(e) => {
+                                    return Err(format!("Failed to refresh MS token (re-authentication required): {}", e));
+                                }
                             }
                         }
                     }
+                    println!("Logged in online as: {}", acc.username);
+                    acc
+                } else {
+                    // Active account is offline
+                    println!("Logged in offline as: {}", acc.username);
+                    acc
                 }
-                println!("Logged in online as: {}", acc.username);
-                acc
             }
             None => {
-                // Perform Device Code OAuth flow in terminal
+                // No accounts at all, start Microsoft Online Device Code login flow
+                println!("No account configured. Starting Microsoft Online Login...");
                 let dev_code = api.request_device_code().await?;
                 println!("To log in, open a web browser and navigate to:");
                 println!("  \x1b[36m\x1b[4m{}\x1b[0m", dev_code.verification_uri);
@@ -203,7 +559,7 @@ async fn handle_cli_launch(
                             auth_account = Some(account);
                             break;
                         }
-                        Ok(None) => {} // pending
+                        Ok(None) => {}
                         Err(e) => {
                             return Err(format!("Authentication failed: {}", e));
                         }
@@ -211,35 +567,6 @@ async fn handle_cli_launch(
                 }
 
                 auth_account.ok_or("Authentication timed out or cancelled.")?
-            }
-        }
-    } else {
-        // Resolve Offline Account
-        let username = username_override
-            .or_else(|| config.get_active_account().map(|a| a.username.clone()))
-            .unwrap_or_else(|| "Player".to_string());
-
-        // Find existing offline account
-        let mut resolved_acc = None;
-        for acc in &config.accounts {
-            if acc.username == username && acc.account_type == AccountType::Offline {
-                resolved_acc = Some(acc.clone());
-                break;
-            }
-        }
-
-        match resolved_acc {
-            Some(acc) => acc,
-            None => {
-                let uuid = Uuid::new_v4().simple().to_string();
-                let acc = Account {
-                    uuid,
-                    username,
-                    account_type: AccountType::Offline,
-                    microsoft_auth: None,
-                };
-                config.add_account(acc.clone());
-                acc
             }
         }
     };
@@ -251,60 +578,13 @@ async fn handle_cli_launch(
         .join(format!("{}.json", version_id));
 
     if !skip_downloads && (!version_json_path.exists() || !config.game_dir.join("versions").join(&version_id).join(format!("{}.jar", version_id)).exists()) {
-        println!("Version JSON/JAR not found locally. Preparing to download {}...", version_id);
-        
-        // Fetch Version Details
-        let manifest = api.fetch_version_manifest().await?;
-        let brief = manifest.versions.iter()
-            .find(|v| v.id == version_id)
-            .ok_or_else(|| format!("Minecraft version '{}' not found in Mojang version manifest.", version_id))?;
-
-        let details = api.fetch_version_details(&brief.url).await?;
-        
-        // Save details locally
-        if let Some(parent) = version_json_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let content = serde_json::to_string_pretty(&details).map_err(|e| e.to_string())?;
-        std::fs::write(&version_json_path, content).map_err(|e| e.to_string())?;
-
-        // Download version assets & libraries
-        let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
-        let downloader = Downloader::new(tx);
-        let game_dir = config.game_dir.clone();
-        
-        tokio::spawn(async move {
-            let _ = downloader.download_version(&game_dir, &details).await;
-        });
-
-        // Simple CLI progress indicator
-        while let Some(update) = rx.recv().await {
-            match update {
-                ProgressUpdate::Started { total: _, message } => {
-                    println!("\n\x1b[33m→ {}\x1b[0m", message);
-                }
-                ProgressUpdate::Progress { completed, total, current_file } => {
-                    print!("\r[\x1b[36m{}/{}\x1b[0m] Downloading: {}                     ", completed, total, current_file);
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
-                ProgressUpdate::Message(msg) => {
-                    println!("\n\x1b[32m✔ {}\x1b[0m", msg);
-                }
-                ProgressUpdate::Finished => {
-                    println!("\n\x1b[32m✔ Download and integrity checks complete!\x1b[0m");
-                }
-                ProgressUpdate::Error(e) => {
-                    return Err(format!("Download failed: {}", e));
-                }
-            }
-        }
+        download_version_files(&config, &version_id).await?;
     }
 
     // 3. Launch Minecraft
     println!("Preparing launch parameters...");
     let launcher = Launcher::new(config);
-    launcher.launch(&version_id, &account)?;
+    launcher.launch(&version_id, &account).await?;
 
     Ok(())
 }
