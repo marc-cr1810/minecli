@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::process::{Command, Stdio};
 
+use crossterm::style::Stylize;
+
 use crate::config::{Config, Account, AccountType};
 use crate::api::{VersionDetails, Rule, ArgumentValue, ArgumentValueList};
 
@@ -350,7 +352,7 @@ impl Launcher {
             if let Some(ref tx) = *log_tx {
                 let _ = tx.try_send(msg);
             } else {
-                println!("{}", msg);
+                println!("{} {}", "→".cyan().bold(), msg.cyan());
             }
         };
 
@@ -379,7 +381,7 @@ impl Launcher {
                 if let Some(ref tx) = log_tx_clone {
                     let _ = tx.try_send(msg);
                 } else {
-                    println!("{}", msg);
+                    println!("{} {}", "→".cyan().bold(), msg.cyan());
                 }
             }).await?
         };
@@ -425,7 +427,7 @@ impl Launcher {
             if let Some(ref tx) = log_tx {
                 let _ = tx.try_send(msg);
             } else {
-                println!("{}", msg);
+                println!("{} {}", "→".cyan().bold(), msg.cyan());
             }
         };
 
@@ -478,7 +480,7 @@ impl Launcher {
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());
 
-            println!("Launch command: {:?}", cmd);
+            println!("{} {:?}", "Launch command:".dim(), cmd);
             let mut child = cmd.spawn()
                 .map_err(|e| format!("Failed to spawn Java process: {}. Is Java installed and configured correctly?", e))?;
             
@@ -492,7 +494,11 @@ impl Launcher {
                 let interpolated = interpolate(post_cmd);
                 log_info(format!("Running post-exit hook: {}", interpolated));
                 if let Err(e) = run_hook_command(&interpolated, &instance.path) {
-                    log_info(format!("Warning: post-exit hook failed: {}", e));
+                    if let Some(ref tx) = log_tx {
+                        let _ = tx.try_send(format!("Warning: post-exit hook failed: {}", e));
+                    } else {
+                        println!("{} Warning: post-exit hook failed: {}", "⚠".yellow().bold(), e);
+                    }
                 }
             }
         }
@@ -503,15 +509,15 @@ impl Launcher {
                 let log_path = instance.path.join("logs").join("latest.log");
                 if let Ok(content) = std::fs::read_to_string(&log_path) {
                     if let Some(analysis) = crate::crash_analyzer::analyze_crash(&instance.path, &content) {
-                        println!("\n==================================================");
-                        println!("[!] CRASH DIAGNOSTICS DETECTED:");
-                        println!("Title: {}", analysis.title);
-                        println!("Cause: {}", analysis.description);
-                        println!("Solutions:");
+                        println!("\n{}", "==================================================".red());
+                        println!("{} {}", "[!]".red().bold(), "CRASH DIAGNOSTICS DETECTED:".red().bold());
+                        println!("{}: {}", "Title".bold(), analysis.title.red());
+                        println!("{}: {}", "Cause".bold(), analysis.description);
+                        println!("{}", "Solutions:".bold());
                         for sol in &analysis.possible_solutions {
-                            println!("  - {}", sol);
+                            println!("  {} {}", "•".red(), sol);
                         }
-                        println!("==================================================\n");
+                        println!("{}\n", "==================================================".red());
                     }
                 }
             }

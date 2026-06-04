@@ -17,6 +17,8 @@ use crate::downloader::{Downloader, ProgressUpdate};
 use crate::launcher::Launcher;
 use crate::instance::Instance;
 
+use crossterm::style::Stylize;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "minecli",
@@ -228,13 +230,13 @@ async fn main() {
     match cli.command {
         Some(Commands::Launch { instance, username, offline, offline_mode }) => {
             if let Err(e) = handle_cli_launch(instance, username, !offline, offline_mode).await {
-                eprintln!("Error: {}", e);
+                eprintln!("{}: {}", "Error".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Instance { action }) => {
             if let Err(e) = handle_instance_command(action).await {
-                eprintln!("Error: {}", e);
+                eprintln!("{}: {}", "Error".red().bold(), e);
                 std::process::exit(1);
             }
         }
@@ -248,19 +250,19 @@ async fn main() {
             }
             if versions.is_empty() {
                 if search.is_some() {
-                    println!("No local versions match the search filter.");
+                    println!("{}", "No local versions match the search filter.".yellow());
                 } else {
-                    println!("No local versions downloaded. Run `minecli` to select and download one.");
+                    println!("{}", "No local versions downloaded. Run `minecli` to select and download one.".yellow());
                 }
             } else {
-                println!("Downloaded Minecraft versions:");
+                println!("{}", "Downloaded Minecraft versions:".cyan().bold());
                 for v in versions {
-                    println!(" - {}", v);
+                    println!("  {} {}", "•".cyan(), v);
                 }
             }
         }
         Some(Commands::ListRemote { release, snapshot, search, limit }) => {
-            println!("Fetching available Minecraft versions...");
+            println!("{}", "Fetching available Minecraft versions...".cyan());
             let api = ApiClient::new();
             match api.fetch_version_manifest().await {
                 Ok(manifest) => {
@@ -282,20 +284,29 @@ async fn main() {
                     let display_list: Vec<_> = filtered_versions.iter().take(print_limit).collect();
                     
                     if display_list.is_empty() {
-                        println!("No remote versions match the specified filters.");
+                        println!("{}", "No remote versions match the specified filters.".yellow());
                     } else {
-                        println!("{:<18} | {:<10} | {}", "Version ID", "Type", "Release Time");
-                        println!("{}", "-".repeat(50));
+                        let col1 = format!("{:<18}", "Version ID");
+                        let col2 = format!("{:<10}", "Type");
+                        println!("{} | {} | {}", col1.cyan().bold(), col2.cyan().bold(), "Release Time".cyan().bold());
+                        println!("{}", "-".repeat(50).dim());
                         for v in &display_list {
-                            println!("{:<18} | {:<10} | {}", v.id, v.r#type, v.releaseTime);
+                            let id_padded = format!("{:<18}", v.id);
+                            let type_padded = format!("{:<10}", v.r#type);
+                            let type_styled = if v.r#type == "release" {
+                                type_padded.green()
+                            } else {
+                                type_padded.yellow()
+                            };
+                            println!("{} | {} | {}", id_padded.bold(), type_styled, v.releaseTime.clone().dim());
                         }
                         if total_count > print_limit {
-                            println!("... and {} more. Launch with `minecli launch <version>` to play.", total_count - print_limit);
+                            println!("{}", format!("... and {} more. Launch with `minecli launch <version>` to play.", total_count - print_limit).italic().dim());
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to fetch remote versions: {}", e);
+                    eprintln!("{}: Failed to fetch remote versions: {}", "Error".red().bold(), e);
                     std::process::exit(1);
                 }
             }
@@ -303,25 +314,25 @@ async fn main() {
         Some(Commands::Download { version }) => {
             let config = Config::load();
             if let Err(e) = download_version_files(&config, &version).await {
-                eprintln!("Error: {}", e);
+                eprintln!("{}: {}", "Error".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Accounts { action }) => {
             if let Err(e) = handle_accounts_command(action).await {
-                eprintln!("Error: {}", e);
+                eprintln!("{}: {}", "Error".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Settings { action }) => {
             if let Err(e) = handle_settings_command(action) {
-                eprintln!("Error: {}", e);
+                eprintln!("{}: {}", "Error".red().bold(), e);
                 std::process::exit(1);
             }
         }
         None => {
             if let Err(e) = tui::run_tui().await {
-                eprintln!("Launcher crashed: {}", e);
+                eprintln!("{} crashed: {}", "Launcher".red().bold(), e);
                 std::process::exit(1);
             }
         }
@@ -343,18 +354,18 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
             let rest = version_id.strip_prefix("fabric-loader-").unwrap();
             let (loader_ver, game_ver) = rest.split_once('-')
                 .ok_or_else(|| format!("Invalid Fabric version ID format: {}", version_id))?;
-            println!("Fetching Fabric profile (Loader: {}, Game: {})...", loader_ver, game_ver);
+            println!("{} (Loader: {}, Game: {})...", "Fetching Fabric profile".cyan(), loader_ver.yellow(), game_ver.yellow());
             api.fetch_fabric_profile(game_ver, loader_ver).await?
         } else if version_id.starts_with("forge-") {
             let loader_ver = version_id.strip_prefix("forge-").unwrap();
-            println!("Fetching Forge profile (Version: {})...", loader_ver);
+            println!("{} (Version: {})...", "Fetching Forge profile".cyan(), loader_ver.yellow());
             api.fetch_forge_profile(loader_ver).await?
         } else if version_id.starts_with("neoforge-") {
             let loader_ver = version_id.strip_prefix("neoforge-").unwrap();
-            println!("Fetching NeoForge profile (Version: {})...", loader_ver);
+            println!("{} (Version: {})...", "Fetching NeoForge profile".cyan(), loader_ver.yellow());
             api.fetch_neoforge_profile(loader_ver).await?
         } else {
-            println!("Fetching details for Minecraft version {}...", version_id);
+            println!("{} {}...", "Fetching details for Minecraft version".cyan(), version_id.yellow());
             let manifest = api.fetch_version_manifest().await?;
             let brief = manifest.versions.iter()
                 .find(|v| v.id == version_id)
@@ -383,18 +394,22 @@ async fn download_version_files(config: &Config, version_id: &str) -> Result<(),
     while let Some(update) = rx.recv().await {
         match update {
             ProgressUpdate::Started { total: _, message } => {
-                println!("\n\x1b[33m→ {}\x1b[0m", message);
+                println!("\n{} {}", "→".yellow().bold(), message.bold());
             }
             ProgressUpdate::Progress { completed, total, current_file } => {
-                print!("\r[\x1b[36m{}/{}\x1b[0m] Downloading: {}                     ", completed, total, current_file);
+                print!(
+                    "\r[{}] Downloading: {}                     ",
+                    format!("{}/{}", completed, total).cyan(),
+                    current_file
+                );
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
             ProgressUpdate::Message(msg) => {
-                println!("\n\x1b[32m✔ {}\x1b[0m", msg);
+                println!("\n{} {}", "✔".green().bold(), msg.green());
             }
             ProgressUpdate::Finished => {
-                println!("\n\x1b[32m✔ Download and integrity checks complete!\x1b[0m");
+                println!("\n{} {}", "✔".green().bold(), "Download and integrity checks complete!".green().bold());
             }
             ProgressUpdate::Error(e) => {
                 return Err(format!("Download failed: {}", e));
@@ -410,16 +425,18 @@ async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
     match action {
         AccountAction::List => {
             if config.accounts.is_empty() {
-                println!("No accounts configured. Use the `accounts add-offline` subcommand or TUI.");
+                println!("{}", "No accounts configured. Use the `accounts add-offline` subcommand or TUI.".yellow());
             } else {
-                println!("Configured Accounts:");
+                println!("{}", "Configured Accounts:".cyan().bold());
                 for acc in &config.accounts {
-                    let active_marker = if config.active_account_uuid.as_deref() == Some(&acc.uuid) { " (ACTIVE)" } else { "" };
+                    let is_active = config.active_account_uuid.as_deref() == Some(&acc.uuid);
+                    let active_marker = if is_active { " (ACTIVE)".green().bold().to_string() } else { "".to_string() };
                     let acc_type = match acc.account_type {
-                        AccountType::Offline => "Offline",
-                        AccountType::Microsoft => "Microsoft",
+                        AccountType::Offline => "Offline".dim(),
+                        AccountType::Microsoft => "Microsoft".magenta(),
                     };
-                    println!(" - {} [{}]{}", acc.username, acc_type, active_marker);
+                    let bullet = if is_active { "•".green() } else { "•".dim() };
+                    println!("  {} {} [{}]{}", bullet, acc.username.clone().bold(), acc_type, active_marker);
                 }
             }
         }
@@ -428,7 +445,7 @@ async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
             if let Some(account) = acc {
                 config.active_account_uuid = Some(account.uuid.clone());
                 config.save()?;
-                println!("Set active account to: {} ({})", account.username, account.uuid);
+                println!("Set active account to: {} ({})", account.username.green().bold(), account.uuid.dim());
             } else {
                 return Err(format!("Account '{}' not found.", name_or_uuid));
             }
@@ -442,16 +459,16 @@ async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
                 microsoft_auth: None,
             };
             config.add_account(account);
-            println!("Successfully added offline profile for: {}", username);
+            println!("{} added offline profile for: {}", "Successfully".green().bold(), username.green());
         }
         AccountAction::Add => {
             let api = ApiClient::new();
             let dev_code = api.request_device_code().await?;
-            println!("To log in, open a web browser and navigate to:");
-            println!("  \x1b[36m\x1b[4m{}\x1b[0m", dev_code.verification_uri);
-            println!("Enter the code below to authorize this launcher:");
-            println!("  \x1b[1m\x1b[32m{}\x1b[0m", dev_code.user_code);
-            println!("Waiting for authentication...");
+            println!("{}", "To log in, open a web browser and navigate to:".cyan());
+            println!("  {}", dev_code.verification_uri.cyan().underlined());
+            println!("{}", "Enter the code below to authorize this launcher:".cyan());
+            println!("  {}", dev_code.user_code.green().bold());
+            println!("{}", "Waiting for authentication...".yellow().italic());
 
             let poll_interval = std::time::Duration::from_secs(dev_code.interval.max(1));
             let mut expires_in = dev_code.expires_in;
@@ -480,8 +497,8 @@ async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
                             }),
                         };
                         
-                        println!("Success!");
-                        println!("Logged in online as: {}", account.username);
+                        println!("{}", "Success!".green().bold());
+                        println!("Logged in online as: {}", account.username.clone().green().bold());
                         config.add_account(account);
                         break;
                     }
@@ -496,7 +513,7 @@ async fn handle_accounts_command(action: AccountAction) -> Result<(), String> {
             let acc = config.accounts.iter().find(|a| a.username == name_or_uuid || a.uuid == name_or_uuid).cloned();
             if let Some(account) = acc {
                 config.remove_account(&account.uuid);
-                println!("Removed account profile: {}", account.username);
+                println!("Removed account profile: {}", account.username.yellow());
             } else {
                 return Err(format!("Account '{}' not found.", name_or_uuid));
             }
@@ -509,25 +526,25 @@ fn handle_settings_command(action: SettingsAction) -> Result<(), String> {
     let mut config = Config::load();
     match action {
         SettingsAction::Show => {
-            println!("Launcher Settings:");
-            println!("  Game Directory:       {}", config.game_dir.display());
-            println!("  Java Executable Path: {}", config.java_path.display());
-            println!("  JVM Extra Arguments:  {}", config.jvm_args.join(" "));
+            println!("{}", "Launcher Settings:".cyan().bold());
+            println!("  {:<22} {}", "Game Directory:".bold(), config.game_dir.display());
+            println!("  {:<22} {}", "Java Executable Path:".bold(), config.java_path.display());
+            println!("  {:<22} {}", "JVM Extra Arguments:".bold(), config.jvm_args.join(" "));
         }
         SettingsAction::SetGameDir { path } => {
             config.game_dir = std::path::PathBuf::from(path.clone());
             config.save()?;
-            println!("Successfully set game directory to: {}", path);
+            println!("{} set game directory to: {}", "Successfully".green().bold(), path);
         }
         SettingsAction::SetJava { path } => {
             config.java_path = std::path::PathBuf::from(path.clone());
             config.save()?;
-            println!("Successfully set Java executable path to: {}", path);
+            println!("{} set Java executable path to: {}", "Successfully".green().bold(), path);
         }
         SettingsAction::SetJvmArgs { args } => {
             config.jvm_args = args.split_whitespace().map(|s| s.to_string()).collect();
             config.save()?;
-            println!("Successfully set JVM arguments to: {}", args);
+            println!("{} set JVM arguments to: {}", "Successfully".green().bold(), args);
         }
     }
     Ok(())
@@ -556,7 +573,7 @@ async fn resolve_and_setup_loader(
         };
 
         let version_id = format!("fabric-loader-{}-{}", loader_ver, game_version);
-        println!("Fetching Fabric profile for loader {}...", loader_ver);
+        println!("{} {}...", "Fetching Fabric profile for loader".cyan(), loader_ver.clone().yellow());
         let profile = api.fetch_fabric_profile(game_version, &loader_ver).await?;
         
         let version_dir = game_dir.join("versions").join(&version_id);
@@ -568,7 +585,7 @@ async fn resolve_and_setup_loader(
         Ok(version_id)
     } else if loader_lower == "forge" || loader_lower == "neoforge" {
         let is_neoforge = loader_lower == "neoforge";
-        println!("Fetching {} version index...", if is_neoforge { "NeoForge" } else { "Forge" });
+        println!("{} {} version index...", "Fetching".cyan(), if is_neoforge { "NeoForge" } else { "Forge" });
         let index = if is_neoforge {
             api.fetch_neoforge_versions().await?
         } else {
@@ -600,7 +617,12 @@ async fn resolve_and_setup_loader(
             format!("forge-{}", selected_ver)
         };
 
-        println!("Fetching {} profile for version {}...", if is_neoforge { "NeoForge" } else { "Forge" }, selected_ver);
+        println!(
+            "{} {} profile for version {}...",
+            "Fetching".cyan(),
+            if is_neoforge { "NeoForge" } else { "Forge" },
+            selected_ver.clone().yellow()
+        );
         let profile = if is_neoforge {
             api.fetch_neoforge_profile(&selected_ver).await?
         } else {
@@ -625,12 +647,14 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
         InstanceAction::List => {
             let list = Instance::load_all(&config.game_dir);
             if list.is_empty() {
-                println!("No instances configured. Use `minecli instance create` or TUI.");
+                println!("{}", "No instances configured. Use `minecli instance create` or TUI.".yellow());
             } else {
-                println!("Available Instances:");
+                println!("{}", "Available Instances:".cyan().bold());
                 for inst in list {
-                    let active_marker = if config.active_instance.as_ref() == Some(&inst.id) { " (ACTIVE)" } else { "" };
-                    println!(" - {} [{}] [Version: {}]{}", inst.config.name, inst.id, inst.config.version, active_marker);
+                    let is_active = config.active_instance.as_ref() == Some(&inst.id);
+                    let active_marker = if is_active { " (ACTIVE)".green().bold().to_string() } else { "".to_string() };
+                    let bullet = if is_active { "•".green() } else { "•".dim() };
+                    println!("  {} {} [{}] [Version: {}]{}", bullet, inst.config.name.bold(), inst.id.dim(), inst.config.version.yellow(), active_marker);
                 }
             }
         }
@@ -641,7 +665,7 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             let resolved_version = if let Some(ref l) = loader {
                 resolve_and_setup_loader(&api, &config.game_dir, &version, l, loader_version).await?
             } else {
-                println!("Validating Minecraft version '{}'...", version);
+                println!("Validating Minecraft version '{}'...", version.clone().yellow());
                 let manifest = api.fetch_version_manifest().await?;
                 if !manifest.versions.iter().any(|v| v.id == version) {
                     return Err(format!("Version '{}' not found in Mojang version manifest.", version));
@@ -653,8 +677,8 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             config.active_instance = Some(inst.id.clone());
             config.save()?;
             
-            println!("Created instance '{}' ({} - {}) and set it as active.", id, name_str, resolved_version);
-            println!("Run `minecli launch {}` to play.", id);
+            println!("Created instance '{}' ({} - {}) and set it as active.", id.clone().green().bold(), name_str, resolved_version.yellow());
+            println!("Run `minecli launch {}` to play.", id.green());
         }
         InstanceAction::Delete { id } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
@@ -663,29 +687,29 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 config.active_instance = None;
                 config.save()?;
             }
-            println!("Deleted instance '{}'.", id);
+            println!("Deleted instance '{}'.", id.yellow());
         }
         InstanceAction::Backup { id } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
-            println!("Creating backup of instance '{}'...", id);
+            println!("Creating backup of instance '{}'...", id.cyan());
             let path = inst.backup()?;
-            println!("Backup created at: {}", path.display());
+            println!("{} created at: {}", "Backup".green().bold(), path.display().to_string().cyan());
         }
         InstanceAction::Restore { id, backup } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
-            println!("Restoring backup '{}' for instance '{}'...", backup, id);
+            println!("Restoring backup '{}' for instance '{}'...", backup.clone().cyan(), id.clone().cyan());
             inst.restore(&backup)?;
-            println!("Instance restored successfully!");
+            println!("{}", "Instance restored successfully!".green().bold());
         }
         InstanceAction::ListBackups { id } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
             let backups = inst.list_backups();
             if backups.is_empty() {
-                println!("No backups found for instance '{}'.", id);
+                println!("No backups found for instance '{}'.", id.yellow());
             } else {
-                println!("Available backups for instance '{}':", id);
+                println!("Available backups for instance '{}':", id.cyan().bold());
                 for backup in backups {
-                    println!(" - {}", backup);
+                    println!("  {} {}", "•".cyan(), backup);
                 }
             }
         }
@@ -693,28 +717,30 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
             let mods = inst.get_mods()?;
             if mods.is_empty() {
-                println!("No mods found for instance '{}'.", id);
+                println!("No mods found for instance '{}'.", id.yellow());
             } else {
-                println!("Mods for instance '{}':", id);
+                println!("Mods for instance '{}':", id.cyan().bold());
                 for m in mods {
-                    let status = if m.enabled { "ENABLED" } else { "DISABLED" };
-                    println!(" - {:<35} [{}] (Version: {})", m.filename, status, m.metadata.version);
+                    let status = if m.enabled { "ENABLED".green().bold() } else { "DISABLED".dim() };
+                    let bullet = if m.enabled { "•".green() } else { "•".dim() };
+                    let filename_padded = format!("{:<35}", m.filename);
+                    println!("  {} {} [{}] (Version: {})", bullet, filename_padded.bold(), status, m.metadata.version.yellow());
                 }
             }
         }
         InstanceAction::EnableMod { id, filename } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
             inst.enable_mod(&filename)?;
-            println!("Enabled mod '{}' in instance '{}'.", filename, id);
+            println!("Enabled mod '{}' in instance '{}'.", filename.green(), id.green());
         }
         InstanceAction::DisableMod { id, filename } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
             inst.disable_mod(&filename)?;
-            println!("Disabled mod '{}' in instance '{}'.", filename, id);
+            println!("Disabled mod '{}' in instance '{}'.", filename.yellow(), id.yellow());
         }
         InstanceAction::Sync { id } => {
             let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
-            println!("Syncing mods for instance '{}'...", id);
+            println!("Syncing mods for instance '{}'...", id.cyan());
             let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
             let game_dir = config.game_dir.clone();
             tokio::spawn(async move {
@@ -723,18 +749,22 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             while let Some(update) = rx.recv().await {
                 match update {
                     ProgressUpdate::Started { total, message } => {
-                        println!("Sync started: {} (Total: {})", message, total);
+                        println!("Sync started: {} (Total: {})", message.bold(), total.to_string().yellow());
                     }
                     ProgressUpdate::Progress { completed, total, current_file } => {
-                        print!("\r[{}/{}] Syncing: {}                             ", completed, total, current_file);
+                        print!(
+                            "\r[{}] Syncing: {}                             ",
+                            format!("{}/{}", completed, total).cyan(),
+                            current_file
+                        );
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
                     }
                     ProgressUpdate::Message(msg) => {
-                        println!("\n{}", msg);
+                        println!("\n{}", msg.green());
                     }
                     ProgressUpdate::Finished => {
-                        println!("\nMod sync completed successfully!");
+                        println!("\n{}", "Mod sync completed successfully!".green().bold());
                     }
                     ProgressUpdate::Error(e) => {
                         return Err(format!("Mod sync failed: {}", e));
@@ -749,10 +779,10 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             if let Some(path) = java_path {
                 if path.is_empty() || path == "clear" {
                     inst.config.java_path = None;
-                    println!("Cleared custom Java path for instance '{}'.", id);
+                    println!("Cleared custom Java path for instance '{}'.", id.clone().cyan());
                 } else {
                     inst.config.java_path = Some(path);
-                    println!("Set custom Java path for instance '{}' to: {}", id, inst.config.java_path.as_ref().unwrap());
+                    println!("Set custom Java path for instance '{}' to: {}", id.clone().cyan(), inst.config.java_path.as_ref().unwrap().clone().green());
                 }
                 modified = true;
             }
@@ -760,19 +790,19 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             if let Some(ver) = java_version {
                 if ver == 0 {
                     inst.config.java_version = None;
-                    println!("Cleared custom JRE version for instance '{}'.", id);
+                    println!("Cleared custom JRE version for instance '{}'.", id.clone().cyan());
                 } else {
                     inst.config.java_version = Some(ver);
-                    println!("Set custom JRE version for instance '{}' to: Java {}", id, ver);
+                    println!("Set custom JRE version for instance '{}' to: Java {}", id.clone().cyan(), ver.to_string().green());
                 }
                 modified = true;
             }
 
             if modified {
                 inst.save()?;
-                println!("Saved settings for instance '{}'.", id);
+                println!("Saved settings for instance '{}'.", id.clone().green());
             } else {
-                println!("No changes specified. Use `--java-path` or `--java-version`.");
+                println!("{}", "No changes specified. Use `--java-path` or `--java-version`.".yellow());
             }
         }
         InstanceAction::ImportPack { path, id } => {
@@ -788,7 +818,7 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                     .to_string()
             });
 
-            println!("Importing modpack '{}' as instance '{}'...", path, custom_id);
+            println!("Importing modpack '{}' as instance '{}'...", path.cyan(), custom_id.clone().green());
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressUpdate>(100);
 
@@ -803,24 +833,24 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             // Print progress
             while let Some(update) = rx.recv().await {
                 match update {
-                    ProgressUpdate::Message(msg) => println!("  {}", msg),
-                    ProgressUpdate::Started { total, message } => println!("  {} ({} files)", message, total),
+                    ProgressUpdate::Message(msg) => println!("  {}", msg.green()),
+                    ProgressUpdate::Started { total, message } => println!("  {} ({} files)", message.bold(), total.to_string().yellow()),
                     ProgressUpdate::Progress { completed, total, current_file } => {
-                        println!("  [{}/{}] {}", completed, total, current_file);
+                        println!("  [{}] {}", format!("{}/{}", completed, total).cyan(), current_file);
                     }
                     ProgressUpdate::Finished => break,
                     ProgressUpdate::Error(e) => {
-                        eprintln!("  Error: {}", e);
+                        eprintln!("  {}: {}", "Error".red().bold(), e);
                     }
                 }
             }
 
             match handle.await {
                 Ok(Ok(inst)) => {
-                    println!("Successfully imported modpack as instance '{}'.", inst.id);
-                    println!("  Version: {}", inst.config.version);
+                    println!("{} imported modpack as instance '{}'.", "Successfully".green().bold(), inst.id.green().bold());
+                    println!("  Version: {}", inst.config.version.yellow());
                     if let Some(mods) = &inst.config.mods {
-                        println!("  Mods: {} declared", mods.len());
+                        println!("  Mods: {} declared", mods.len().to_string().cyan());
                     }
                 }
                 Ok(Err(e)) => return Err(format!("Import failed: {}", e)),
@@ -829,24 +859,30 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
         }
         InstanceAction::SearchPack { query } => {
             let api = ApiClient::new();
-            println!("Searching Modrinth for modpacks matching '{}'...", query);
+            println!("Searching Modrinth for modpacks matching '{}'...", query.clone().cyan());
             let hits = api.search_modpacks(&query).await?;
             if hits.is_empty() {
-                println!("No modpacks found.");
+                println!("{}", "No modpacks found.".yellow());
             } else {
-                println!("{:<24} | {:<20} | {:<12} | {}", "Title", "ID/Slug", "Downloads", "Description");
-                println!("{}", "-".repeat(80));
+                let col1 = format!("{:<24}", "Title");
+                let col2 = format!("{:<20}", "ID/Slug");
+                let col3 = format!("{:<12}", "Downloads");
+                println!("{} | {} | {} | {}", col1.cyan().bold(), col2.cyan().bold(), col3.cyan().bold(), "Description".cyan().bold());
+                println!("{}", "-".repeat(100).dim());
                 for hit in hits {
                     let desc = if hit.description.len() > 40 {
                         format!("{}...", &hit.description[..37])
                     } else {
                         hit.description.clone()
                     };
+                    let title_padded = format!("{:<24}", hit.title);
+                    let id_padded = format!("{:<20}", hit.project_id);
+                    let downloads_padded = format!("{:<12}", hit.downloads);
                     println!(
-                        "{:<24} | {:<20} | {:<12} | {}",
-                        hit.title,
-                        hit.project_id,
-                        hit.downloads,
+                        "{} | {} | {} | {}",
+                        title_padded.bold(),
+                        id_padded.dim(),
+                        downloads_padded.green(),
                         desc
                     );
                 }
@@ -858,9 +894,9 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 .ok_or_else(|| format!("Instance '{}' not found.", id))?;
 
             let out_path = std::path::PathBuf::from(&output_path);
-            println!("Exporting instance '{}' to '{}'...", id, out_path.display());
+            println!("Exporting instance '{}' to '{}'...", id.cyan(), out_path.display().to_string().cyan());
             inst.export_mrpack(&out_path)?;
-            println!("Successfully exported modpack!");
+            println!("{}", "Successfully exported modpack!".green().bold());
         }
     }
     Ok(())
@@ -930,7 +966,7 @@ async fn handle_cli_launch(
                     if let Some(ref auth) = acc.microsoft_auth {
                         let is_expired = auth.expires_at.map(|exp| exp < chrono::Utc::now()).unwrap_or(true);
                         if is_expired {
-                            println!("Session expired. Refreshing Microsoft tokens...");
+                            println!("{}", "Session expired. Refreshing Microsoft tokens...".yellow());
                             match api.refresh_token(&auth.refresh_token).await {
                                 Ok(token_res) => {
                                     match api.login_with_microsoft(&token_res.access_token).await {
@@ -954,21 +990,21 @@ async fn handle_cli_launch(
                             }
                         }
                     }
-                    println!("Logged in online as: {}", acc.username);
+                    println!("Logged in online as: {}", acc.username.clone().green().bold());
                     acc
                 } else {
-                    println!("Logged in offline as: {}", acc.username);
+                    println!("Logged in offline as: {}", acc.username.clone().green().bold());
                     acc
                 }
             }
             None => {
-                println!("No account configured. Starting Microsoft Online Login...");
+                println!("{}", "No account configured. Starting Microsoft Online Login...".yellow());
                 let dev_code = api.request_device_code().await?;
-                println!("To log in, open a web browser and navigate to:");
-                println!("  \x1b[36m\x1b[4m{}\x1b[0m", dev_code.verification_uri);
-                println!("Enter the code below to authorize this launcher:");
-                println!("  \x1b[1m\x1b[32m{}\x1b[0m", dev_code.user_code);
-                println!("Waiting for authentication...");
+                println!("{}", "To log in, open a web browser and navigate to:".cyan());
+                println!("  {}", dev_code.verification_uri.cyan().underlined());
+                println!("{}", "Enter the code below to authorize this launcher:".cyan());
+                println!("  {}", dev_code.user_code.green().bold());
+                println!("{}", "Waiting for authentication...".yellow().italic());
 
                 let poll_interval = std::time::Duration::from_secs(dev_code.interval.max(1));
                 let mut expires_in = dev_code.expires_in;
@@ -998,8 +1034,8 @@ async fn handle_cli_launch(
                                 }),
                             };
                             
-                            println!("Success!");
-                            println!("Logged in online as: {}", account.username);
+                            println!("{}", "Success!".green().bold());
+                            println!("Logged in online as: {}", account.username.clone().green().bold());
                             config.add_account(account.clone());
                             auth_account = Some(account);
                             break;
@@ -1041,7 +1077,7 @@ async fn handle_cli_launch(
         download_version_files(&config, &version_id).await?;
     }
 
-    println!("Preparing launch parameters...");
+    println!("{}", "Preparing launch parameters...".cyan());
     let launcher = Launcher::new(config);
     launcher.launch(&instance, &account).await?;
 
