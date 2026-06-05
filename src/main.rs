@@ -6,6 +6,7 @@ mod tui;
 mod java;
 mod instance;
 mod crash_analyzer;
+mod assets;
 
 use clap::{Parser, Subcommand};
 use tokio::sync::mpsc;
@@ -213,6 +214,51 @@ enum InstanceAction {
         /// Do not prompt, automatically apply all updates
         #[arg(short, long)]
         yes: bool,
+    },
+    /// List all worlds/saves in an instance
+    ListWorlds {
+        id: String,
+    },
+    /// Delete a world/save in an instance
+    DeleteWorld {
+        id: String,
+        name: String,
+    },
+    /// Create a ZIP backup of a world/save
+    BackupWorld {
+        id: String,
+        name: String,
+    },
+    /// List resource packs for an instance
+    ListResourcePacks {
+        id: String,
+    },
+    /// Toggle (enable/disable) a resource pack
+    ToggleResourcePack {
+        id: String,
+        filename: String,
+    },
+    /// List shader packs for an instance
+    ListShaders {
+        id: String,
+    },
+    /// Toggle (enable/disable) a shader pack
+    ToggleShader {
+        id: String,
+        filename: String,
+    },
+    /// Automatically download and install shader support (Iris/Sodium or Oculus/Embeddium)
+    EnableShaders {
+        id: String,
+    },
+    /// List screenshots for an instance
+    ListScreenshots {
+        id: String,
+    },
+    /// Delete a screenshot from an instance
+    DeleteScreenshot {
+        id: String,
+        filename: String,
     },
 }
 
@@ -1081,6 +1127,158 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
                 }
                 println!("{}", "Finished applying updates!".green().bold());
             }
+        }
+        InstanceAction::ListWorlds { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let worlds = assets::list_worlds(&inst.path)?;
+            if worlds.is_empty() {
+                println!("No worlds found for instance '{}'.", id.yellow());
+            } else {
+                println!("Worlds for instance '{}':", id.cyan().bold());
+                for w in worlds {
+                    let size_mb = (w.size_bytes as f64) / (1024.0 * 1024.0);
+                    println!(
+                        "  {} {} (Last played: {}, Size: {:.2} MB)",
+                        "•".cyan(),
+                        w.name.bold(),
+                        w.last_played.yellow(),
+                        size_mb
+                    );
+                }
+            }
+        }
+        InstanceAction::DeleteWorld { id, name } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            assets::delete_world(&inst.path, &name)?;
+            println!("Deleted world '{}' from instance '{}'.", name.yellow(), id.yellow());
+        }
+        InstanceAction::BackupWorld { id, name } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            println!("Backing up world '{}'...", name.clone().cyan());
+            let path = assets::backup_world(&inst.path, &name)?;
+            println!("{} world backup created at: {}", "Success:".green().bold(), path.display().to_string().cyan());
+        }
+        InstanceAction::ListResourcePacks { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let packs = assets::list_resourcepacks(&inst.path)?;
+            if packs.is_empty() {
+                println!("No resource packs found for instance '{}'.", id.yellow());
+            } else {
+                println!("Resource packs for instance '{}':", id.cyan().bold());
+                for p in packs {
+                    let status = if p.enabled { "ENABLED".green().bold() } else { "DISABLED".dim() };
+                    let bullet = if p.enabled { "•".green() } else { "•".dim() };
+                    let size_mb = (p.size_bytes as f64) / (1024.0 * 1024.0);
+                    println!(
+                        "  {} {} [{}] ({:.2} MB)",
+                        bullet,
+                        p.filename.bold(),
+                        status,
+                        size_mb
+                    );
+                }
+            }
+        }
+        InstanceAction::ToggleResourcePack { id, filename } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            assets::toggle_resourcepack(&inst.path, &filename)?;
+            println!("Toggled resource pack '{}' in instance '{}'.", filename.green(), id.green());
+        }
+        InstanceAction::ListShaders { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            
+            // Check compatibility first
+            if !assets::detect_shader_support(&inst.path) {
+                println!("{}", "Warning: No shader mod (Iris, Oculus, OptiFine) detected in this instance. Shaders will not load until support is enabled.".red().bold());
+            }
+
+            let shaders = assets::list_shaderpacks(&inst.path)?;
+            if shaders.is_empty() {
+                println!("No shader packs found for instance '{}'.", id.yellow());
+            } else {
+                println!("Shader packs for instance '{}':", id.cyan().bold());
+                for s in shaders {
+                    let status = if s.enabled { "ENABLED".green().bold() } else { "DISABLED".dim() };
+                    let bullet = if s.enabled { "•".green() } else { "•".dim() };
+                    let size_mb = (s.size_bytes as f64) / (1024.0 * 1024.0);
+                    println!(
+                        "  {} {} [{}] ({:.2} MB)",
+                        bullet,
+                        s.filename.bold(),
+                        status,
+                        size_mb
+                    );
+                }
+            }
+        }
+        InstanceAction::ToggleShader { id, filename } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            
+            if !assets::detect_shader_support(&inst.path) {
+                println!("{}", "Warning: No shader mod (Iris, Oculus, OptiFine) detected in this instance. Shaders will not load until support is enabled.".red().bold());
+            }
+
+            assets::toggle_shaderpack(&inst.path, &filename)?;
+            println!("Toggled shader pack '{}' in instance '{}'.", filename.green(), id.green());
+        }
+        InstanceAction::EnableShaders { id } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            
+            if assets::detect_shader_support(&inst.path) {
+                println!("Shader support is already enabled for instance '{}'.", id.cyan());
+                return Ok(());
+            }
+
+            println!("Enabling shader support for instance '{}'...", id.cyan());
+            let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(100);
+            let game_dir = config.game_dir.clone();
+            tokio::spawn(async move {
+                let _ = inst.install_shader_support(&game_dir, tx).await;
+            });
+
+            while let Some(update) = rx.recv().await {
+                match update {
+                    ProgressUpdate::Started { total, message } => {
+                        println!("Installation started: {} (Total steps: {})", message.bold(), total.to_string().yellow());
+                    }
+                    ProgressUpdate::Progress { completed, total, current_file } => {
+                        println!("  [{}/{}] Downloading: {}", completed + 1, total, current_file);
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        println!("  {}", msg.green());
+                    }
+                    ProgressUpdate::Finished => {
+                        println!("{}", "Shader support enabled successfully!".green().bold());
+                    }
+                    ProgressUpdate::Error(e) => {
+                        return Err(format!("Failed to enable shader support: {}", e));
+                    }
+                }
+            }
+        }
+        InstanceAction::ListScreenshots { id } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let screenshots = assets::list_screenshots(&inst.path)?;
+            if screenshots.is_empty() {
+                println!("No screenshots found for instance '{}'.", id.yellow());
+            } else {
+                println!("Screenshots for instance '{}':", id.cyan().bold());
+                for s in screenshots {
+                    let size_kb = (s.size_bytes as f64) / 1024.0;
+                    println!(
+                        "  {} {} (Created: {}, Size: {:.1} KB)",
+                        "•".cyan(),
+                        s.filename.bold(),
+                        s.created.yellow(),
+                        size_kb
+                    );
+                }
+            }
+        }
+        InstanceAction::DeleteScreenshot { id, filename } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            assets::delete_screenshot(&inst.path, &filename)?;
+            println!("Deleted screenshot '{}' from instance '{}'.", filename.yellow(), id.yellow());
         }
     }
     Ok(())

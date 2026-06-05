@@ -851,6 +851,75 @@ impl Instance {
 
         (version_id.clone(), loader)
     }
+
+    pub async fn install_shader_support(
+        &mut self,
+        game_dir: &Path,
+        progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
+    ) -> Result<(), String> {
+        let (game_version, loader) = self.get_game_version_and_loader(game_dir);
+        let loader_str = match loader.as_deref() {
+            Some(l) => l.to_lowercase(),
+            None => {
+                let _ = progress_tx.send(ProgressUpdate::Error("Vanilla instances do not support mods. Please convert this instance to Fabric or Forge first.".to_string())).await;
+                return Err("Vanilla instances do not support mods. Please convert this instance to Fabric or Forge first.".to_string());
+            }
+        };
+
+        let mod_slugs = if loader_str == "fabric" || loader_str == "quilt" {
+            vec!["iris", "sodium"]
+        } else if loader_str == "forge" || loader_str == "neoforge" {
+            vec!["oculus", "embeddium"]
+        } else {
+            let _ = progress_tx.send(ProgressUpdate::Error(format!("Unsupported loader '{}' for automatic shader support.", loader_str))).await;
+            return Err(format!("Unsupported loader '{}' for automatic shader support.", loader_str));
+        };
+
+        let total_steps = mod_slugs.len();
+        let _ = progress_tx.send(ProgressUpdate::Started {
+            total: total_steps,
+            message: format!("Installing shader support ({})", loader_str),
+        }).await;
+
+        let api = crate::api::ApiClient::new();
+
+        for (idx, slug) in mod_slugs.iter().enumerate() {
+            let _ = progress_tx.send(ProgressUpdate::Message(format!("Searching Modrinth for '{}'...", slug))).await;
+            
+            let versions = api.fetch_modpack_versions(slug).await
+                .map_err(|e| format!("Failed to fetch version list for '{}': {}", slug, e))?;
+
+            let compatible_version = versions.into_iter().find(|v| {
+                v.game_versions.contains(&game_version)
+                    && v.loaders.iter().any(|l| l.to_lowercase() == loader_str)
+            });
+
+            let version = match compatible_version {
+                Some(v) => v,
+                None => {
+                    let err_msg = format!("No version of '{}' found compatible with Minecraft {} for loader '{}'.", slug, game_version, loader_str);
+                    let _ = progress_tx.send(ProgressUpdate::Error(err_msg.clone())).await;
+                    return Err(err_msg);
+                }
+            };
+
+            let primary_file = version.files.iter().find(|f| f.primary).or_else(|| version.files.first())
+                .ok_or_else(|| format!("No files found in compatibility release for '{}'.", slug))?;
+
+            let _ = progress_tx.send(ProgressUpdate::Progress {
+                completed: idx,
+                total: total_steps,
+                current_file: primary_file.filename.clone(),
+            }).await;
+
+            let _ = progress_tx.send(ProgressUpdate::Message(format!("Downloading {}...", primary_file.filename))).await;
+
+            self.install_mod_from_url(game_dir, &primary_file.filename, &primary_file.url, None, true).await?;
+        }
+
+        let _ = progress_tx.send(ProgressUpdate::Finished).await;
+        Ok(())
+    }
 }
 
 pub fn read_mod_metadata(jar_path: &Path) -> Result<ModMetadata, String> {

@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, BorderType, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -177,6 +177,43 @@ enum AppState {
         current_file: String,
         message: String,
         rx: tokio::sync::mpsc::Receiver<ProgressUpdate>,
+    },
+    AssetManager {
+        instance_idx: usize,
+        selected_category: usize,
+        has_shader_support: bool,
+    },
+    WorldManager {
+        instance_idx: usize,
+        worlds: Vec<crate::assets::WorldInfo>,
+        list_state: ListState,
+        confirm_delete: Option<String>,
+    },
+    ResourcePackManager {
+        instance_idx: usize,
+        packs: Vec<crate::assets::AssetInfo>,
+        list_state: ListState,
+    },
+    ShaderPackManager {
+        instance_idx: usize,
+        shaders: Vec<crate::assets::AssetInfo>,
+        list_state: ListState,
+        has_shader_support: bool,
+    },
+    InstallingShaderSupport {
+        instance_idx: usize,
+        completed: usize,
+        total: usize,
+        current_file: String,
+        message: String,
+        logs: Vec<String>,
+        rx: tokio::sync::mpsc::Receiver<ProgressUpdate>,
+    },
+    ScreenshotManager {
+        instance_idx: usize,
+        screenshots: Vec<crate::assets::ScreenshotInfo>,
+        list_state: ListState,
+        confirm_delete: Option<String>,
     },
 }
 
@@ -711,6 +748,58 @@ impl App {
                 } else {
                     self.state = AppState::Normal;
                 }
+            } else {
+                self.state = AppState::Normal;
+            }
+        }
+
+        // 3h. Process Shader Support Installation progress updates
+        let mut shader_install_finished_state = None;
+        if let AppState::InstallingShaderSupport { instance_idx, ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut logs, ref mut rx } = self.state {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ProgressUpdate::Started { total: t, message: msg } => {
+                        *total = t;
+                        *completed = 0;
+                        *message = msg.clone();
+                        logs.push(msg);
+                    }
+                    ProgressUpdate::Progress { completed: c, total: t, current_file: f } => {
+                        *completed = c;
+                        *total = t;
+                        *current_file = f.clone();
+                        logs.push(format!("Installing: {}", f));
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        *message = msg.clone();
+                        logs.push(msg);
+                    }
+                    ProgressUpdate::Finished => {
+                        shader_install_finished_state = Some((instance_idx, Ok(())));
+                    }
+                    ProgressUpdate::Error(e) => {
+                        shader_install_finished_state = Some((instance_idx, Err(e)));
+                    }
+                }
+            }
+        }
+        if let Some((instance_idx, res)) = shader_install_finished_state {
+            match res {
+                Ok(_) => {
+                    self.status_message = Some(("Shader support enabled successfully!".to_string(), false));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Failed to install shader support: {}", e), true));
+                }
+            }
+            if let Some(inst) = self.instances.get(instance_idx) {
+                let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                let mut list_state = ListState::default();
+                if !shaders.is_empty() {
+                    list_state.select(Some(0));
+                }
+                let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
             } else {
                 self.state = AppState::Normal;
             }
@@ -1358,7 +1447,9 @@ impl App {
                 Span::styled(" [P]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), 
                 Span::raw(" Import Modpack (.mrpack)  "),
                 Span::styled("[M]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), 
-                Span::raw(" Manage Mods"),
+                Span::raw(" Manage Mods   "),
+                Span::styled("[A]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Asset Manager (Saves/Packs/Screenshots)"),
             ]),
         ];
         
@@ -2318,6 +2409,385 @@ impl App {
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
                 f.render_widget(help_p, chunks[1]);
+            }
+
+            AppState::AssetManager { instance_idx, selected_category, has_shader_support } => {
+                let instance_idx = *instance_idx;
+                let selected_category = *selected_category;
+                let has_shader_support = *has_shader_support;
+                let area = get_centered_rect_helper(60, 40, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" Asset Manager — {} ", inst_name))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let categories = vec![
+                    "📁 Worlds & Save Games",
+                    "🎨 Resource Packs",
+                    "🕶️ Shader Packs",
+                    "📷 Screenshots",
+                ];
+
+                let list_items: Vec<ListItem> = categories.iter().enumerate().map(|(idx, cat)| {
+                    let mut text = vec![Span::styled(*cat, Style::default().fg(Color::White))];
+                    if idx == 2 {
+                        let support_span = if has_shader_support {
+                            Span::styled(" (Support: Enabled)", Style::default().fg(Color::Green))
+                        } else {
+                            Span::styled(" (Support: Disabled)", Style::default().fg(Color::Red))
+                        };
+                        text.push(support_span);
+                    }
+                    ListItem::new(Line::from(text))
+                }).collect();
+
+                let mut category_list_state = ListState::default();
+                category_list_state.select(Some(selected_category));
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Categories ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], &mut category_list_state);
+
+                let help_text = "Press [Up/Down] to navigate, [Enter] to select, [Esc] to back";
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+            }
+
+            AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete } => {
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" World Manager — {} ({} worlds) ", inst_name, worlds.len()))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = worlds.iter().map(|w| {
+                    let size_mb = (w.size_bytes as f64) / (1024.0 * 1024.0);
+                    let line = Line::from(vec![
+                        Span::styled(" • ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(&w.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" ({})", w.folder_name), Style::default().fg(Color::Rgb(120, 120, 130))),
+                        Span::styled(format!("  Size: {:.2} MB", size_mb), Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("  Played: {}", w.last_played), Style::default().fg(Color::Rgb(160, 160, 170))),
+                    ]);
+                    ListItem::new(line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Worlds / Saves ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], list_state);
+
+                let help_text = "Press [Up/Down] to navigate, [b] to backup (ZIP), [d] to delete, [Esc] to back";
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+
+                if let Some(world_name) = confirm_delete.as_ref() {
+                    let confirm_area = get_centered_rect_helper(50, 25, size);
+                    f.render_widget(Clear, confirm_area);
+                    let confirm_block = Block::default()
+                        .title(" Confirm World Deletion ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                    f.render_widget(confirm_block.clone(), confirm_area);
+                    
+                    let confirm_inner = confirm_area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                    let confirm_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1),
+                            Constraint::Min(4),
+                            Constraint::Length(2),
+                        ])
+                        .split(confirm_inner);
+
+                    f.render_widget(Paragraph::new("⚠️  CRITICAL WARNING  ⚠️").alignment(ratatui::layout::Alignment::Center).style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)), confirm_chunks[0]);
+                    
+                    let warn_msg = format!(
+                        "Are you absolutely sure you want to permanently delete the world:\n\n  \"{}\"\n\nThis action is IRREVERSIBLE!",
+                        world_name
+                    );
+                    f.render_widget(Paragraph::new(warn_msg).wrap(Wrap { trim: true }).alignment(ratatui::layout::Alignment::Center), confirm_chunks[1]);
+                    
+                    f.render_widget(Paragraph::new("Press [y/Y] to confirm permanent deletion, [any other key] to cancel").style(Style::default().fg(Color::Rgb(160, 160, 170))).alignment(ratatui::layout::Alignment::Center), confirm_chunks[2]);
+                }
+            }
+
+            AppState::ResourcePackManager { instance_idx, packs, list_state } => {
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" Resource Packs — {} ({} packs) ", inst_name, packs.len()))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = packs.iter().map(|p| {
+                    let status = if p.enabled { "✓" } else { "✗" };
+                    let status_color = if p.enabled { Color::Green } else { Color::Red };
+                    let size_mb = (p.size_bytes as f64) / (1024.0 * 1024.0);
+                    let line = Line::from(vec![
+                        Span::styled(format!(" [{}] ", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(&p.filename, Style::default().fg(Color::White)),
+                        Span::styled(format!("  Size: {:.2} MB", size_mb), Style::default().fg(Color::Rgb(140, 140, 150))),
+                    ]);
+                    ListItem::new(line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Installed Resource Packs ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], list_state);
+
+                let help_text = "Press [Space/Enter] to toggle enable/disable, [Esc] to back";
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+            }
+
+            AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support } => {
+                let instance_idx = *instance_idx;
+                let has_shader_support = *has_shader_support;
+                let area = get_centered_rect_helper(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" Shader Pack Manager — {} ({} shaders) ", inst_name, shaders.len()))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let (status_banner, banner_style) = if has_shader_support {
+                    ("✓ Shader support is enabled for this instance. Shaders will load successfully in-game.", Style::default().fg(Color::Green))
+                } else {
+                    ("⚠️ Shader support is not enabled. Press [i/I] to automatically install Iris/Sodium or Oculus/Embeddium mods.", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                };
+                let status_p = Paragraph::new(status_banner)
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL).title(" Compatibility Status ").border_style(banner_style));
+                f.render_widget(status_p, chunks[0]);
+
+                let list_items: Vec<ListItem> = shaders.iter().map(|s| {
+                    let status = if s.enabled { "✓" } else { "✗" };
+                    let status_color = if s.enabled { Color::Green } else { Color::Red };
+                    let size_mb = (s.size_bytes as f64) / (1024.0 * 1024.0);
+                    let line = Line::from(vec![
+                        Span::styled(format!(" [{}] ", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(&s.filename, Style::default().fg(Color::White)),
+                        Span::styled(format!("  Size: {:.2} MB", size_mb), Style::default().fg(Color::Rgb(140, 140, 150))),
+                    ]);
+                    ListItem::new(line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Installed Shaders ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[1], list_state);
+
+                let help_text = if has_shader_support {
+                    "Press [Space/Enter] to toggle enable/disable, [Esc] to back"
+                } else {
+                    "Press [i/I] to install shader compatibility mod, [Esc] to back"
+                };
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[2]);
+            }
+
+            AppState::InstallingShaderSupport { instance_idx: _, completed, total, current_file, message, logs, rx: _ } => {
+                let area = get_centered_rect_helper(80, 60, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(" Installing Shader Support Mods ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(4),
+                    ])
+                    .split(inner);
+
+                f.render_widget(Paragraph::new(message.as_str()).style(Style::default().fg(Color::Cyan)), chunks[0]);
+
+                let pct = if *total > 0 { (*completed as f64 / *total as f64 * 100.0) as u16 } else { 0 };
+                let label = format!("{} / {} ({}%)", completed, total, pct);
+                let gauge = Gauge::default()
+                    .block(Block::default().borders(Borders::ALL).title(current_file.as_str()))
+                    .gauge_style(Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 40)))
+                    .percent(pct)
+                    .label(label);
+                f.render_widget(gauge, chunks[1]);
+
+                let log_items: Vec<ListItem> = logs.iter().rev().take(10).map(|log| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(" • ", Style::default().fg(Color::Green)),
+                        Span::styled(log, Style::default().fg(Color::Rgb(180, 180, 180))),
+                    ]))
+                }).collect();
+
+                let logs_list = List::new(log_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Installation Log ").border_style(Style::default().fg(border_color)));
+                f.render_widget(logs_list, chunks[2]);
+            }
+
+            AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete } => {
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(80, 80, size);
+                f.render_widget(Clear, area);
+
+                let inst_name = self.instances.get(instance_idx)
+                    .map(|i| i.config.name.clone())
+                    .unwrap_or_else(|| "?".to_string());
+
+                let block = Block::default()
+                    .title(format!(" Screenshot Manager — {} ({} screenshots) ", inst_name, screenshots.len()))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = screenshots.iter().map(|s| {
+                    let size_kb = (s.size_bytes as f64) / 1024.0;
+                    let line = Line::from(vec![
+                        Span::styled(" • ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(&s.filename, Style::default().fg(Color::White)),
+                        Span::styled(format!("  Size: {:.1} KB", size_kb), Style::default().fg(Color::Yellow)),
+                        Span::styled(format!("  Created: {}", s.created), Style::default().fg(Color::Rgb(160, 160, 170))),
+                    ]);
+                    ListItem::new(line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Screenshots ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], list_state);
+
+                let help_text = "Press [d] to delete screenshot, [Esc] to back";
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[1]);
+
+                if let Some(screenshot_name) = confirm_delete.as_ref() {
+                    let confirm_area = get_centered_rect_helper(50, 20, size);
+                    f.render_widget(Clear, confirm_area);
+                    let confirm_block = Block::default()
+                        .title(" Confirm Deletion ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+                    f.render_widget(confirm_block.clone(), confirm_area);
+                    
+                    let confirm_inner = confirm_area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                    let confirm_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(4),
+                            Constraint::Length(2),
+                        ])
+                        .split(confirm_inner);
+
+                    let warn_msg = format!(
+                        "Are you sure you want to permanently delete screenshot:\n\n  \"{}\"",
+                        screenshot_name
+                    );
+                    f.render_widget(Paragraph::new(warn_msg).wrap(Wrap { trim: true }).alignment(ratatui::layout::Alignment::Center), confirm_chunks[0]);
+                    
+                    f.render_widget(Paragraph::new("Press [y/Y] to confirm, [any other key] to cancel").style(Style::default().fg(Color::Rgb(160, 160, 170))).alignment(ratatui::layout::Alignment::Center), confirm_chunks[1]);
+                }
             }
 
             AppState::ModManager { instance_idx, mods, mod_list_state } => {
@@ -3527,6 +3997,337 @@ impl App {
                 }
             }
 
+            AppState::AssetManager { instance_idx, selected_category, has_shader_support } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.state = AppState::Normal;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let next_cat = if selected_category > 0 { selected_category - 1 } else { 3 };
+                        self.state = AppState::AssetManager { instance_idx, selected_category: next_cat, has_shader_support };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let next_cat = if selected_category < 3 { selected_category + 1 } else { 0 };
+                        self.state = AppState::AssetManager { instance_idx, selected_category: next_cat, has_shader_support };
+                    }
+                    KeyCode::Enter => {
+                        if let Some(inst) = self.instances.get(instance_idx) {
+                            match selected_category {
+                                0 => {
+                                    let worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                                    let mut state = ListState::default();
+                                    if !worlds.is_empty() {
+                                        state.select(Some(0));
+                                    }
+                                    self.state = AppState::WorldManager { instance_idx, worlds, list_state: state, confirm_delete: None };
+                                }
+                                1 => {
+                                    let packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                                    let mut state = ListState::default();
+                                    if !packs.is_empty() {
+                                        state.select(Some(0));
+                                    }
+                                    self.state = AppState::ResourcePackManager { instance_idx, packs, list_state: state };
+                                }
+                                2 => {
+                                    let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                                    let mut state = ListState::default();
+                                    if !shaders.is_empty() {
+                                        state.select(Some(0));
+                                    }
+                                    self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state: state, has_shader_support };
+                                }
+                                3 => {
+                                    let screenshots = crate::assets::list_screenshots(&inst.path).unwrap_or_default();
+                                    let mut state = ListState::default();
+                                    if !screenshots.is_empty() {
+                                        state.select(Some(0));
+                                    }
+                                    self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state: state, confirm_delete: None };
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::WorldManager { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::WorldManager { instance_idx, mut worlds, mut list_state, confirm_delete } = state {
+                    if let Some(ref world_name) = confirm_delete {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Some(inst) = self.instances.get(instance_idx) {
+                                    if let Err(e) = crate::assets::delete_world(&inst.path, world_name) {
+                                        self.status_message = Some((format!("Failed to delete world: {}", e), true));
+                                    } else {
+                                        self.status_message = Some((format!("Deleted world '{}'", world_name), false));
+                                    }
+                                    worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                                    let new_selected = list_state.selected().map(|s| s.min(worlds.len().saturating_sub(1)));
+                                    list_state.select(new_selected);
+                                }
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                            _ => {
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Esc => {
+                                let has_shader_support = self.instances.get(instance_idx)
+                                    .map(|inst| crate::assets::detect_shader_support(&inst.path))
+                                    .unwrap_or(false);
+                                self.state = AppState::AssetManager { instance_idx, selected_category: 0, has_shader_support };
+                            }
+                            KeyCode::Up => {
+                                let selected = list_state.selected().unwrap_or(0);
+                                if selected > 0 {
+                                    list_state.select(Some(selected - 1));
+                                }
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                            KeyCode::Down => {
+                                let selected = list_state.selected().unwrap_or(0);
+                                if selected + 1 < worlds.len() {
+                                    list_state.select(Some(selected + 1));
+                                }
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(w) = worlds.get(selected) {
+                                        let name_to_delete = w.folder_name.clone();
+                                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: Some(name_to_delete) };
+                                    } else {
+                                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                    }
+                                } else {
+                                    self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                }
+                            }
+                            KeyCode::Char('b') | KeyCode::Char('B') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(w) = worlds.get(selected) {
+                                        if let Some(inst) = self.instances.get(instance_idx) {
+                                            match crate::assets::backup_world(&inst.path, &w.folder_name) {
+                                                Ok(path) => {
+                                                    self.status_message = Some((format!("Backup created: {}", path.file_name().unwrap().to_string_lossy()), false));
+                                                }
+                                                Err(e) => {
+                                                    self.status_message = Some((format!("Backup failed: {}", e), true));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                            _ => {
+                                self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                            }
+                        }
+                    }
+                }
+            }
+
+            AppState::ResourcePackManager { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::ResourcePackManager { instance_idx, mut packs, mut list_state } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            let has_shader_support = self.instances.get(instance_idx)
+                                .map(|inst| crate::assets::detect_shader_support(&inst.path))
+                                .unwrap_or(false);
+                            self.state = AppState::AssetManager { instance_idx, selected_category: 1, has_shader_support };
+                        }
+                        KeyCode::Up => {
+                            let selected = list_state.selected().unwrap_or(0);
+                            if selected > 0 {
+                                list_state.select(Some(selected - 1));
+                            }
+                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                        }
+                        KeyCode::Down => {
+                            let selected = list_state.selected().unwrap_or(0);
+                            if selected + 1 < packs.len() {
+                                list_state.select(Some(selected + 1));
+                            }
+                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some(selected) = list_state.selected() {
+                                if let Some(pack) = packs.get_mut(selected) {
+                                    if let Some(inst) = self.instances.get(instance_idx) {
+                                        if let Err(e) = crate::assets::toggle_resourcepack(&inst.path, &pack.filename) {
+                                            self.status_message = Some((format!("Toggle failed: {}", e), true));
+                                        } else {
+                                            pack.enabled = !pack.enabled;
+                                            pack.filename = if pack.enabled {
+                                                pack.filename.strip_suffix(".disabled").unwrap_or(&pack.filename).to_string()
+                                            } else {
+                                                format!("{}.disabled", pack.filename)
+                                            };
+                                            self.status_message = Some((format!("Toggled {}", pack.filename), false));
+                                        }
+                                    }
+                                }
+                            }
+                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                        }
+                        _ => {
+                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                        }
+                    }
+                }
+            }
+
+            AppState::ShaderPackManager { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::ShaderPackManager { instance_idx, mut shaders, mut list_state, has_shader_support } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.state = AppState::AssetManager { instance_idx, selected_category: 2, has_shader_support };
+                        }
+                        KeyCode::Up => {
+                            let selected = list_state.selected().unwrap_or(0);
+                            if selected > 0 {
+                                list_state.select(Some(selected - 1));
+                            }
+                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                        }
+                        KeyCode::Down => {
+                            let selected = list_state.selected().unwrap_or(0);
+                            if selected + 1 < shaders.len() {
+                                list_state.select(Some(selected + 1));
+                            }
+                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                        }
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if has_shader_support {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(shader) = shaders.get_mut(selected) {
+                                        if let Some(inst) = self.instances.get(instance_idx) {
+                                            if let Err(e) = crate::assets::toggle_shaderpack(&inst.path, &shader.filename) {
+                                                self.status_message = Some((format!("Toggle failed: {}", e), true));
+                                            } else {
+                                                shader.enabled = !shader.enabled;
+                                                shader.filename = if shader.enabled {
+                                                    shader.filename.strip_suffix(".disabled").unwrap_or(&shader.filename).to_string()
+                                                } else {
+                                                    format!("{}.disabled", shader.filename)
+                                                };
+                                                self.status_message = Some((format!("Toggled {}", shader.filename), false));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                        }
+                        KeyCode::Char('i') | KeyCode::Char('I') => {
+                            if !has_shader_support {
+                                if let Some(inst) = self.instances.get(instance_idx) {
+                                    let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                                    let game_dir = self.config.game_dir.clone();
+                                    let mut inst_clone = inst.clone();
+                                    
+                                    tokio::spawn(async move {
+                                        let _ = inst_clone.install_shader_support(&game_dir, tx).await;
+                                    });
+
+                                    self.state = AppState::InstallingShaderSupport {
+                                        instance_idx,
+                                        completed: 0,
+                                        total: 100,
+                                        current_file: String::new(),
+                                        message: "Resolving shader mods...".to_string(),
+                                        logs: Vec::new(),
+                                        rx,
+                                    };
+                                } else {
+                                    self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                                }
+                            } else {
+                                self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                            }
+                        }
+                        _ => {
+                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                        }
+                    }
+                }
+            }
+
+            AppState::ScreenshotManager { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::ScreenshotManager { instance_idx, mut screenshots, mut list_state, confirm_delete } = state {
+                    if let Some(ref filename) = confirm_delete {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Some(inst) = self.instances.get(instance_idx) {
+                                    if let Err(e) = crate::assets::delete_screenshot(&inst.path, filename) {
+                                        self.status_message = Some((format!("Failed to delete: {}", e), true));
+                                    } else {
+                                        self.status_message = Some(("Deleted screenshot".to_string(), false));
+                                    }
+                                    screenshots = crate::assets::list_screenshots(&inst.path).unwrap_or_default();
+                                    let new_selected = list_state.selected().map(|s| s.min(screenshots.len().saturating_sub(1)));
+                                    list_state.select(new_selected);
+                                }
+                                self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                            }
+                            _ => {
+                                self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                            }
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Esc => {
+                                let has_shader_support = self.instances.get(instance_idx)
+                                    .map(|inst| crate::assets::detect_shader_support(&inst.path))
+                                    .unwrap_or(false);
+                                self.state = AppState::AssetManager { instance_idx, selected_category: 3, has_shader_support };
+                            }
+                            KeyCode::Up => {
+                                let selected = list_state.selected().unwrap_or(0);
+                                if selected > 0 {
+                                    list_state.select(Some(selected - 1));
+                                }
+                                self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                            }
+                            KeyCode::Down => {
+                                let selected = list_state.selected().unwrap_or(0);
+                                if selected + 1 < screenshots.len() {
+                                    list_state.select(Some(selected + 1));
+                                }
+                                self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(s) = screenshots.get(selected) {
+                                        let name_to_delete = s.filename.clone();
+                                        self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: Some(name_to_delete) };
+                                    } else {
+                                        self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                                    }
+                                } else {
+                                    self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                                }
+                            }
+                            _ => {
+                                self.state = AppState::ScreenshotManager { instance_idx, screenshots, list_state, confirm_delete: None };
+                            }
+                        }
+                    }
+                }
+            }
+
+            AppState::InstallingShaderSupport { .. } => {}
+
             AppState::ModManager { .. } => {
                 let state = std::mem::replace(&mut self.state, AppState::Normal);
                 if let AppState::ModManager { instance_idx, mut mods, mut mod_list_state } = state {
@@ -3914,6 +4715,17 @@ impl App {
                             self.state = AppState::ExportingModpackPath { instance_idx: idx };
                             self.version_search_query.clear();
                         }
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        if let Some(idx) = self.instances_list_state.selected()
+                            && let Some(inst) = self.instances.get(idx) {
+                                let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                                self.state = AppState::AssetManager {
+                                    instance_idx: idx,
+                                    selected_category: 0,
+                                    has_shader_support,
+                                };
+                            }
                     }
                     _ => {}
                 }
