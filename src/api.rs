@@ -696,6 +696,48 @@ impl ApiClient {
             .await
             .map_err(|e| format!("Failed to parse modpack versions: {}", e))
     }
+
+    pub async fn search_mods(
+        &self,
+        query: &str,
+        game_version: Option<&str>,
+        loader: Option<&str>,
+    ) -> Result<Vec<ModrinthSearchHit>, String> {
+        let url = "https://api.modrinth.com/v2/search";
+        
+        let mut facets = vec![vec!["project_type:mod".to_string()]];
+        if let Some(v) = game_version {
+            facets.push(vec![format!("versions:{}", v)]);
+        }
+        if let Some(l) = loader {
+            facets.push(vec![format!("categories:{}", l.to_lowercase())]);
+        }
+
+        let facets_json = serde_json::to_string(&facets).map_err(|e| e.to_string())?;
+
+        self.client.get(url)
+            .query(&[("query", query), ("facets", &facets_json)])
+            .header("User-Agent", "minecli/0.1.0 (contact@minecli.invalid)")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to search Modrinth: {}", e))?
+            .json::<ModrinthSearchResponse>()
+            .await
+            .map(|r| r.hits)
+            .map_err(|e| format!("Failed to parse Modrinth search response: {}", e))
+    }
+
+    pub async fn fetch_project(&self, project_id: &str) -> Result<ModrinthProject, String> {
+        let url = format!("https://api.modrinth.com/v2/project/{}", project_id);
+        self.client.get(&url)
+            .header("User-Agent", "minecli/0.1.0 (contact@minecli.invalid)")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch Modrinth project: {}", e))?
+            .json::<ModrinthProject>()
+            .await
+            .map_err(|e| format!("Failed to parse Modrinth project: {}", e))
+    }
 }
 
 // --- Fabric response models ---
@@ -757,6 +799,14 @@ pub struct ModrinthVersionFile {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthDependency {
+    pub version_id: Option<String>,
+    pub project_id: Option<String>,
+    pub file_name: Option<String>,
+    pub dependency_type: String, // "required", "optional", "incompatible", "embedded"
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct ModrinthVersion {
     pub id: String,
     pub name: String,
@@ -765,6 +815,18 @@ pub struct ModrinthVersion {
     pub files: Vec<ModrinthVersionFile>,
     #[serde(rename = "game_versions")]
     pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<ModrinthDependency>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ModrinthProject {
+    pub id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
 }
 
 #[cfg(test)]

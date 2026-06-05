@@ -458,6 +458,114 @@ impl Instance {
         Ok(())
     }
 
+    pub async fn install_mod_from_url(
+        &mut self,
+        game_dir: &Path,
+        filename: &str,
+        url: &str,
+        sha1: Option<&str>,
+        save_to_toml: bool,
+    ) -> Result<(), String> {
+        let cache_dir = game_dir.join("cache").join("mods");
+        let mods_dir = self.path.join("mods");
+        fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&mods_dir).map_err(|e| e.to_string())?;
+
+        let ext = if url.contains(".jar") { "jar" } else { "jar" };
+        let cache_filename = if let Some(s) = sha1 {
+            format!("{}.{}", s, ext)
+        } else {
+            use sha1::{Sha1, Digest};
+            let mut hasher = Sha1::new();
+            hasher.update(url.as_bytes());
+            format!("{:x}.{}", hasher.finalize(), ext)
+        };
+
+        let cache_path = cache_dir.join(&cache_filename);
+        let target_filename = if filename.ends_with(".jar") { filename.to_string() } else { format!("{}.jar", filename) };
+        let target_path = mods_dir.join(&target_filename);
+
+        // Download
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let downloader = crate::downloader::Downloader::new(tx);
+        downloader.download_file(url, &cache_path, sha1.unwrap_or("")).await?;
+
+        // Link or copy
+        if target_path.exists() {
+            let _ = fs::remove_file(&target_path);
+        }
+        
+        // Remove .disabled version if present
+        let disabled_target_filename = format!("{}.disabled", target_filename);
+        let disabled_target_path = mods_dir.join(&disabled_target_filename);
+        if disabled_target_path.exists() {
+            let _ = fs::remove_file(&disabled_target_path);
+        }
+
+        if fs::hard_link(&cache_path, &target_path).is_err() {
+            fs::copy(&cache_path, &target_path)
+                .map_err(|e| format!("Failed to copy mod to instance mods: {}", e))?;
+        }
+
+        if save_to_toml {
+            let mut mods_map = self.config.mods.clone().unwrap_or_default();
+            mods_map.insert(target_filename, ModValue::Detailed {
+                url: url.to_string(),
+                sha1: sha1.map(|s| s.to_string()),
+            });
+            self.config.mods = Some(mods_map);
+            self.save()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_mod(&mut self, filename_or_id: &str, delete_from_toml: bool) -> Result<(), String> {
+        let mods_dir = self.path.join("mods");
+        let mods = self.get_mods()?;
+        let target_mod = mods.iter().find(|m| {
+            m.filename == filename_or_id
+                || m.metadata.id == filename_or_id
+                || m.metadata.name == filename_or_id
+                || m.filename.strip_suffix(".disabled").unwrap_or(&m.filename).strip_suffix(".jar").unwrap_or(&m.filename) == filename_or_id
+        });
+
+        if let Some(m) = target_mod {
+            let path = mods_dir.join(&m.filename);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("Failed to delete mod file: {}", e))?;
+            }
+            
+            let disabled_filename = if m.filename.ends_with(".disabled") {
+                m.filename.clone()
+            } else {
+                format!("{}.disabled", m.filename)
+            };
+            let disabled_path = mods_dir.join(&disabled_filename);
+            if disabled_path.exists() {
+                let _ = fs::remove_file(&disabled_path);
+            }
+
+            let enabled_filename = m.filename.strip_suffix(".disabled").unwrap_or(&m.filename).to_string();
+            let enabled_path = mods_dir.join(&enabled_filename);
+            if enabled_path.exists() {
+                let _ = fs::remove_file(&enabled_path);
+            }
+
+            if delete_from_toml {
+                if let Some(ref mut mods_map) = self.config.mods {
+                    mods_map.remove(&enabled_filename);
+                    mods_map.remove(&disabled_filename);
+                    mods_map.remove(&m.filename);
+                    self.save()?;
+                }
+            }
+            Ok(())
+        } else {
+            Err(format!("Mod '{}' not found in instance.", filename_or_id))
+        }
+    }
+
     pub fn export_mrpack(&self, output_path: &Path) -> Result<(), String> {
         let file = File::create(output_path).map_err(|e| format!("Failed to create output file: {}", e))?;
         let mut zip = zip::ZipWriter::new(file);
@@ -704,6 +812,44 @@ impl Instance {
         let _ = progress_tx.send(ProgressUpdate::Finished).await;
 
         Ok(inst)
+    }
+
+    pub fn get_game_version_and_loader(&self, game_dir: &Path) -> (String, Option<String>) {
+        let version_id = &self.config.version;
+        let mut loader = None;
+        if version_id.to_lowercase().contains("fabric") {
+            loader = Some("fabric".to_string());
+        } else if version_id.to_lowercase().contains("neoforge") {
+            loader = Some("neoforge".to_string());
+        } else if version_id.to_lowercase().contains("forge") {
+            loader = Some("forge".to_string());
+        }
+
+        // Try to load version JSON to find inheritsFrom
+        let json_path = game_dir
+            .join("versions")
+            .join(version_id)
+            .join(format!("{}.json", version_id));
+
+        if json_path.exists() {
+            if let Ok(content) = fs::read_to_string(json_path) {
+                if let Ok(details) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(inherits) = details.get("inheritsFrom").and_then(|v| v.as_str()) {
+                        return (inherits.to_string(), loader);
+                    }
+                }
+            }
+        }
+
+        // Fallback: if fabric-loader-x.y.z-1.a.b, try to get last part
+        if version_id.starts_with("fabric-loader-") {
+            let parts: Vec<&str> = version_id.split('-').collect();
+            if parts.len() >= 4 {
+                return (parts[3].to_string(), loader);
+            }
+        }
+
+        (version_id.clone(), loader)
     }
 }
 

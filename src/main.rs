@@ -179,6 +179,41 @@ enum InstanceAction {
         /// Output path for the .mrpack file
         output_path: String,
     },
+    /// Search Modrinth for compatible mods
+    SearchMod {
+        /// Instance ID to check compatibility against
+        id: String,
+        /// Search query
+        query: String,
+    },
+    /// Add/install a mod to an instance
+    AddMod {
+        /// Instance ID
+        id: String,
+        /// Modrinth mod ID or slug
+        mod_id: String,
+        /// Skip downloading dependencies
+        #[arg(long)]
+        no_deps: bool,
+        /// Save mod to instance.toml for future declarative sync
+        #[arg(long, default_value_t = true)]
+        save: bool,
+    },
+    /// Remove/delete a mod from an instance
+    RemoveMod {
+        /// Instance ID
+        id: String,
+        /// Filename or Modrinth ID of the mod to remove
+        filename_or_id: String,
+    },
+    /// Check for and apply updates to installed mods
+    UpdateMods {
+        /// Instance ID
+        id: String,
+        /// Do not prompt, automatically apply all updates
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -896,6 +931,157 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             inst.export_mrpack(&out_path)?;
             println!("{}", "Successfully exported modpack!".green().bold());
         }
+        InstanceAction::SearchMod { id, query } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            
+            println!(
+                "Searching Modrinth for mods matching '{}' compatible with Minecraft {} ({})...",
+                query.clone().cyan(),
+                game_version.clone().yellow(),
+                loader.as_deref().unwrap_or("vanilla").yellow()
+            );
+            
+            let api = ApiClient::new();
+            let hits = api.search_mods(&query, Some(&game_version), loader.as_deref()).await?;
+            
+            if hits.is_empty() {
+                println!("{}", "No compatible mods found.".yellow());
+            } else {
+                let col1 = format!("{:<24}", "Title");
+                let col2 = format!("{:<20}", "ID/Slug");
+                let col3 = format!("{:<12}", "Downloads");
+                println!("{} | {} | {} | {}", col1.cyan().bold(), col2.cyan().bold(), col3.cyan().bold(), "Description".cyan().bold());
+                println!("{}", "-".repeat(100).dim());
+                for hit in hits {
+                    let desc = if hit.description.len() > 40 {
+                        format!("{}...", &hit.description[..37])
+                    } else {
+                        hit.description.clone()
+                    };
+                    let title_padded = format!("{:<24}", hit.title);
+                    let id_padded = format!("{:<20}", hit.project_id);
+                    let downloads_padded = format!("{:<12}", hit.downloads);
+                    println!(
+                        "{} | {} | {} | {}",
+                        title_padded.bold(),
+                        id_padded.dim(),
+                        downloads_padded.green(),
+                        desc
+                    );
+                }
+            }
+        }
+        InstanceAction::AddMod { id, mod_id, no_deps, save } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            
+            let mut installed_projects = std::collections::HashSet::new();
+            // Populate installed_projects with already installed mods' IDs and slugs to avoid re-downloads
+            if let Ok(existing_mods) = inst.get_mods() {
+                for m in existing_mods {
+                    installed_projects.insert(m.metadata.id.clone());
+                    installed_projects.insert(m.metadata.name.clone());
+                }
+            }
+
+            install_mod_recursive(
+                &api,
+                &config.game_dir,
+                &mut inst,
+                &mod_id,
+                &game_version,
+                loader.as_deref(),
+                no_deps,
+                save,
+                &mut installed_projects,
+            ).await?;
+
+            println!("{}", "Finished adding mods!".green().bold());
+        }
+        InstanceAction::RemoveMod { id, filename_or_id } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            println!("Deleting mod '{}' from instance '{}'...", filename_or_id.clone().cyan(), id.cyan());
+            inst.remove_mod(&filename_or_id, true)?;
+            println!("{}", "Mod removed successfully!".green().bold());
+        }
+        InstanceAction::UpdateMods { id, yes } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let mods = inst.get_mods()?;
+            
+            if mods.is_empty() {
+                println!("No mods installed in instance '{}'.", id.yellow());
+                return Ok(());
+            }
+
+            println!("Checking for updates for {} mods...", mods.len().to_string().cyan());
+            let api = ApiClient::new();
+            let mut updates = Vec::new();
+            
+            for m in &mods {
+                let project_id_or_slug = m.metadata.id.clone();
+                if let Ok(versions) = api.fetch_modpack_versions(&project_id_or_slug).await {
+                    let compatible_version = versions.into_iter().find(|v| {
+                        let matches_game = v.game_versions.contains(&game_version);
+                        let matches_loader = match loader.as_deref() {
+                            Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+                            None => true,
+                        };
+                        matches_game && matches_loader
+                    });
+
+                    if let Some(latest_ver) = compatible_version {
+                        if latest_ver.version_number != m.metadata.version {
+                            updates.push((m.clone(), latest_ver));
+                        }
+                    }
+                }
+            }
+
+            if updates.is_empty() {
+                println!("{}", "All mods are up to date!".green().bold());
+                return Ok(());
+            }
+
+            println!("\nUpdates available:");
+            for (local_mod, remote_ver) in &updates {
+                println!(
+                    "  • {}: {} -> {}",
+                    local_mod.metadata.name.clone().bold(),
+                    local_mod.metadata.version.clone().red(),
+                    remote_ver.version_number.clone().green()
+                );
+            }
+
+            let apply_updates = if yes {
+                true
+            } else {
+                print!("\nApply all updates? [Y/n]: ");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).is_ok()
+                    && (input.trim().is_empty() || input.trim().to_lowercase().starts_with('y'))
+            };
+
+            if apply_updates {
+                for (local_mod, remote_ver) in updates {
+                    if let Some(file) = remote_ver.files.iter().find(|f| f.primary || f.filename.ends_with(".jar"))
+                        .or_else(|| remote_ver.files.first()) {
+                            println!("Updating {}...", local_mod.metadata.name.clone().cyan());
+                            let _ = inst.remove_mod(&local_mod.filename, false);
+                            if let Err(e) = inst.install_mod_from_url(&config.game_dir, &file.filename, &file.url, None, true).await {
+                                println!("Warning: Failed to update mod {}: {}", local_mod.metadata.name.clone(), e);
+                            } else {
+                                println!("Updated {} to {}!", local_mod.metadata.name.clone().green(), remote_ver.version_number.clone().yellow());
+                            }
+                        }
+                }
+                println!("{}", "Finished applying updates!".green().bold());
+            }
+        }
     }
     Ok(())
 }
@@ -1075,6 +1261,95 @@ async fn handle_cli_launch(
     println!("{}", "Preparing launch parameters...".cyan());
     let launcher = Launcher::new(config);
     launcher.launch(&instance, &account).await?;
+
+    Ok(())
+}
+
+async fn install_mod_recursive(
+    api: &ApiClient,
+    game_dir: &std::path::Path,
+    inst: &mut Instance,
+    project_id_or_slug: &str,
+    game_version: &str,
+    loader: Option<&str>,
+    no_deps: bool,
+    save: bool,
+    installed_projects: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if installed_projects.contains(project_id_or_slug) {
+        return Ok(());
+    }
+
+    println!("Resolving version for mod '{}'...", project_id_or_slug.cyan());
+    
+    let versions = api.fetch_modpack_versions(project_id_or_slug).await?;
+    let compatible_version = versions.into_iter().find(|v| {
+        let matches_game = v.game_versions.contains(&game_version.to_string());
+        let matches_loader = match loader {
+            Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+            None => true,
+        };
+        matches_game && matches_loader
+    });
+
+    let ver = match compatible_version {
+        Some(v) => v,
+        None => {
+            return Err(format!(
+                "No compatible version of mod '{}' found for Minecraft {} and loader '{}'.",
+                project_id_or_slug,
+                game_version,
+                loader.unwrap_or("vanilla")
+            ));
+        }
+    };
+
+    let file = ver.files.iter().find(|f| f.primary || f.filename.ends_with(".jar"))
+        .or_else(|| ver.files.first())
+        .ok_or_else(|| format!("No file found in version {} for mod {}", ver.name, project_id_or_slug))?;
+
+    println!("Downloading {} (version: {})...", file.filename.clone().green(), ver.version_number.clone().yellow());
+    
+    inst.install_mod_from_url(game_dir, &file.filename, &file.url, None, save).await?;
+    
+    installed_projects.insert(project_id_or_slug.to_string());
+    if let Ok(project) = api.fetch_project(project_id_or_slug).await {
+        installed_projects.insert(project.id);
+        installed_projects.insert(project.slug);
+    }
+
+    if !no_deps {
+        for dep in &ver.dependencies {
+            if dep.dependency_type == "required" {
+                if let Some(ref dep_project_id) = dep.project_id {
+                    if installed_projects.contains(dep_project_id) {
+                        continue;
+                    }
+                    
+                    let dep_name = match api.fetch_project(dep_project_id).await {
+                        Ok(p) => p.title,
+                        Err(_) => dep_project_id.clone(),
+                    };
+                    
+                    println!("Installing required dependency: {}", dep_name.clone().yellow().bold());
+                    
+                    if let Err(e) = Box::pin(install_mod_recursive(
+                        api,
+                        game_dir,
+                        inst,
+                        dep_project_id,
+                        game_version,
+                        loader,
+                        no_deps,
+                        save,
+                        installed_projects,
+                    )).await {
+                        println!("Warning: Failed to install dependency {}: {}", dep_name, e);
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }

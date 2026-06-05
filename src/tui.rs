@@ -145,6 +145,39 @@ enum AppState {
     ExportingModpackPath {
         instance_idx: usize,
     },
+    SearchingModQuery {
+        instance_idx: usize,
+    },
+    SearchingModLoading {
+        instance_idx: usize,
+        query: String,
+        rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthSearchHit>, String>>,
+    },
+    SearchingModResults {
+        instance_idx: usize,
+        query: String,
+        hits: Vec<crate::api::ModrinthSearchHit>,
+        list_state: ListState,
+    },
+    SearchingModVersionsLoading {
+        instance_idx: usize,
+        hit: crate::api::ModrinthSearchHit,
+        rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthVersion>, String>>,
+    },
+    SearchingModVersions {
+        instance_idx: usize,
+        hit: crate::api::ModrinthSearchHit,
+        versions: Vec<crate::api::ModrinthVersion>,
+        list_state: ListState,
+    },
+    InstallingModProgress {
+        instance_idx: usize,
+        completed: usize,
+        total: usize,
+        current_file: String,
+        message: String,
+        rx: tokio::sync::mpsc::Receiver<ProgressUpdate>,
+    },
 }
 
 pub struct App {
@@ -527,7 +560,7 @@ impl App {
             self.refresh_instances();
         }
 
-        // 3c. Process Modrinth search results
+        // 3c. Process Modrinth Modpack search results
         let mut search_finished_state = None;
         if let AppState::SearchingModpackLoading { ref query, ref mut rx } = self.state
             && let Ok(res) = rx.try_recv() {
@@ -549,7 +582,7 @@ impl App {
             }
         }
 
-        // 3d. Process Modrinth version results
+        // 3d. Process Modrinth Modpack version results
         let mut versions_finished_state = None;
         if let AppState::SearchingModpackVersionsLoading { ref hit, ref mut rx } = self.state
             && let Ok(res) = rx.try_recv() {
@@ -569,6 +602,119 @@ impl App {
                     self.state = AppState::Normal;
                 }
             }
+        }
+
+        // 3e. Process Modrinth Mod search results
+        let mut mod_search_finished_state = None;
+        if let AppState::SearchingModLoading { instance_idx, ref query, ref mut rx } = self.state
+            && let Ok(res) = rx.try_recv() {
+                mod_search_finished_state = Some((instance_idx, query.clone(), res));
+            }
+        if let Some((instance_idx, query, res)) = mod_search_finished_state {
+            match res {
+                Ok(hits) => {
+                    let mut list_state = ListState::default();
+                    if !hits.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    self.state = AppState::SearchingModResults { instance_idx, query, hits, list_state };
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Search failed: {}", e), true));
+                    self.state = AppState::SearchingModQuery { instance_idx };
+                }
+            }
+        }
+
+        // 3f. Process Modrinth Mod version results
+        let mut mod_versions_finished_state = None;
+        if let AppState::SearchingModVersionsLoading { instance_idx, ref hit, ref mut rx } = self.state
+            && let Ok(res) = rx.try_recv() {
+                mod_versions_finished_state = Some((instance_idx, hit.clone(), res));
+            }
+        if let Some((instance_idx, hit, res)) = mod_versions_finished_state {
+            match res {
+                Ok(versions) => {
+                    let mut list_state = ListState::default();
+                    if let Some(inst) = self.instances.get(instance_idx) {
+                        let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
+                        let compatible_versions: Vec<crate::api::ModrinthVersion> = versions.into_iter().filter(|v| {
+                            let matches_game = v.game_versions.contains(&game_version);
+                            let matches_loader = match loader.as_deref() {
+                                Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+                                None => true,
+                            };
+                            matches_game && matches_loader
+                        }).collect();
+
+                        if compatible_versions.is_empty() {
+                            self.status_message = Some((format!("No compatible versions found for Minecraft {} ({}).", game_version, loader.as_deref().unwrap_or("vanilla")), true));
+                            self.state = AppState::SearchingModQuery { instance_idx };
+                        } else {
+                            list_state.select(Some(0));
+                            self.state = AppState::SearchingModVersions { instance_idx, hit, versions: compatible_versions, list_state };
+                        }
+                    } else {
+                        self.state = AppState::Normal;
+                    }
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Failed to load versions: {}", e), true));
+                    self.state = AppState::Normal;
+                }
+            }
+        }
+
+        // 3g. Process Mod Installation progress updates
+        let mut mod_install_finished_state = None;
+        if let AppState::InstallingModProgress { instance_idx, ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut rx } = self.state {
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    ProgressUpdate::Started { total: t, message: msg } => {
+                        *total = t;
+                        *completed = 0;
+                        *message = msg;
+                    }
+                    ProgressUpdate::Progress { completed: c, total: t, current_file: f } => {
+                        *completed = c;
+                        *total = t;
+                        *current_file = f;
+                    }
+                    ProgressUpdate::Message(msg) => {
+                        *message = msg;
+                    }
+                    ProgressUpdate::Finished => {
+                        mod_install_finished_state = Some((instance_idx, Ok(())));
+                    }
+                    ProgressUpdate::Error(e) => {
+                        mod_install_finished_state = Some((instance_idx, Err(e)));
+                    }
+                }
+            }
+        }
+        if let Some((instance_idx, res)) = mod_install_finished_state {
+            match res {
+                Ok(_) => {
+                    self.status_message = Some(("Mod installed successfully!".to_string(), false));
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Failed to install mod: {}", e), true));
+                }
+            }
+            if let Some(inst) = self.instances.get(instance_idx) {
+                if let Ok(mods) = inst.get_mods() {
+                    let mut mod_list_state = ListState::default();
+                    if !mods.is_empty() {
+                        mod_list_state.select(Some(0));
+                    }
+                    self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                } else {
+                    self.state = AppState::Normal;
+                }
+            } else {
+                self.state = AppState::Normal;
+            }
+            self.refresh_instances();
         }
 
         // 4. Process Game Log streams and termination status
@@ -1083,7 +1229,7 @@ impl App {
         f.render_widget(welcome, chunks[2]);
     }
 
-    fn draw_instances(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
+    fn draw_instances(&mut self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
         let main_block = Block::default()
             .title(" Minecraft Instance Manager ")
             .borders(Borders::ALL)
@@ -1131,8 +1277,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(" Available Instances ").border_style(Style::default().fg(border_color)))
             .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-        let mut state = self.instances_list_state.clone();
-        f.render_stateful_widget(list, list_chunks[0], &mut state);
+        f.render_stateful_widget(list, list_chunks[0], &mut self.instances_list_state);
 
         // Highlighted instance detail panel on the right
         let selected_idx = self.instances_list_state.selected().unwrap_or(0);
@@ -1211,7 +1356,9 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled(" [P]", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)), 
-                Span::raw(" Import Modpack (.mrpack)"),
+                Span::raw(" Import Modpack (.mrpack)  "),
+                Span::styled("[M]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), 
+                Span::raw(" Manage Mods"),
             ]),
         ];
         
@@ -1220,7 +1367,7 @@ impl App {
         f.render_widget(help_p, chunks[1]);
     }
 
-    fn draw_accounts(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
+    fn draw_accounts(&mut self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
         let main_block = Block::default()
             .title(" Account Profile Manager ")
             .borders(Borders::ALL)
@@ -1265,8 +1412,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(" Configured Accounts ").border_style(Style::default().fg(border_color)))
             .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-        let mut state = self.account_list_state.clone();
-        f.render_stateful_widget(list, chunks[0], &mut state);
+        f.render_stateful_widget(list, chunks[0], &mut self.account_list_state);
 
         let help_text = vec![
             Line::from(vec![Span::styled(" [A]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), Span::raw(" Add Account               "), Span::styled("[O]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)), Span::raw(" Add Offline Profile")]),
@@ -1278,7 +1424,7 @@ impl App {
         f.render_widget(help_p, chunks[1]);
     }
 
-    fn draw_settings(&self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
+    fn draw_settings(&mut self, f: &mut ratatui::Frame, rect: Rect, border_color: Color, select_color: Color) {
         let main_block = Block::default()
             .title(" Launcher Preferences ")
             .borders(Borders::ALL)
@@ -1312,8 +1458,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(" Launcher Settings ").border_style(Style::default().fg(border_color)))
             .highlight_style(Style::default().bg(select_color).fg(Color::White));
 
-        let mut state = self.settings_list_state.clone();
-        f.render_stateful_widget(list, chunks[0], &mut state);
+        f.render_stateful_widget(list, chunks[0], &mut self.settings_list_state);
 
         let help_text = "Press [Enter] on a selected preference to edit its value.\nChanges are automatically saved to your configuration file.";
         let help_p = Paragraph::new(help_text)
@@ -1338,12 +1483,12 @@ impl App {
         f.render_widget(footer_p, rect);
     }
 
-    fn draw_overlays(&self, f: &mut ratatui::Frame, size: Rect, select_color: Color, border_color: Color) {
-        match self.state {
+    fn draw_overlays(&mut self, f: &mut ratatui::Frame, size: Rect, select_color: Color, border_color: Color) {
+        match &mut self.state {
             AppState::Normal => {}
             
             AppState::AddOfflineAccount => {
-                let area = self.get_centered_rect(50, 20, size);
+                let area = get_centered_rect_helper(50, 20, size);
                 f.render_widget(Clear, area); 
                 
                 let block = Block::default()
@@ -1376,7 +1521,7 @@ impl App {
             }
 
             AppState::CreatingInstanceName => {
-                let area = self.get_centered_rect(50, 20, size);
+                let area = get_centered_rect_helper(50, 20, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1409,7 +1554,8 @@ impl App {
             }
 
             AppState::ModpackMenu { selected_option } => {
-                let area = self.get_centered_rect(50, 25, size);
+                let selected_option = *selected_option;
+                let area = get_centered_rect_helper(50, 25, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1450,7 +1596,7 @@ impl App {
             }
 
             AppState::SearchingModpackQuery => {
-                let area = self.get_centered_rect(60, 20, size);
+                let area = get_centered_rect_helper(60, 20, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1482,8 +1628,8 @@ impl App {
                 f.render_widget(help, inner_layout[3]);
             }
 
-            AppState::SearchingModpackLoading { ref query, .. } => {
-                let area = self.get_centered_rect(50, 15, size);
+            AppState::SearchingModpackLoading { query, .. } => {
+                let area = get_centered_rect_helper(50, 15, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1500,8 +1646,8 @@ impl App {
                 f.render_widget(p, inner);
             }
 
-            AppState::SearchingModpackResults { ref query, ref hits, ref list_state } => {
-                let area = self.get_centered_rect(80, 80, size);
+            AppState::SearchingModpackResults { query, hits, list_state } => {
+                let area = get_centered_rect_helper(80, 80, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1533,8 +1679,7 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Matching Modpacks ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = list_state.clone();
-                f.render_stateful_widget(list, chunks[0], &mut state);
+                f.render_stateful_widget(list, chunks[0], list_state);
 
                 let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to select version, [Esc] to Search Query")
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
@@ -1542,8 +1687,8 @@ impl App {
                 f.render_widget(help, chunks[1]);
             }
 
-            AppState::SearchingModpackVersionsLoading { ref hit, .. } => {
-                let area = self.get_centered_rect(50, 15, size);
+            AppState::SearchingModpackVersionsLoading { hit, .. } => {
+                let area = get_centered_rect_helper(50, 15, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1560,8 +1705,8 @@ impl App {
                 f.render_widget(p, inner);
             }
 
-            AppState::SearchingModpackVersions { ref hit, ref versions, ref list_state } => {
-                let area = self.get_centered_rect(75, 75, size);
+            AppState::SearchingModpackVersions { hit, versions, list_state } => {
+                let area = get_centered_rect_helper(75, 75, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1593,8 +1738,7 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Available Versions ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = list_state.clone();
-                f.render_stateful_widget(list, chunks[0], &mut state);
+                f.render_stateful_widget(list, chunks[0], list_state);
 
                 let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to download/import, [Esc] to Cancel")
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
@@ -1602,8 +1746,8 @@ impl App {
                 f.render_widget(help, chunks[1]);
             }
 
-            AppState::SearchingModpackConfirmId { ref hit, ref version, .. } => {
-                let area = self.get_centered_rect(50, 22, size);
+            AppState::SearchingModpackConfirmId { hit, version, .. } => {
+                let area = get_centered_rect_helper(50, 22, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1637,7 +1781,8 @@ impl App {
             }
 
             AppState::ExportingModpackPath { instance_idx } => {
-                let area = self.get_centered_rect(60, 20, size);
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(60, 20, size);
                 f.render_widget(Clear, area);
                 
                 let inst_name = self.instances.get(instance_idx).map(|i| i.config.name.as_str()).unwrap_or("Instance");
@@ -1671,7 +1816,7 @@ impl App {
             }
 
             AppState::ImportingModpackPath => {
-                let area = self.get_centered_rect(60, 20, size);
+                let area = get_centered_rect_helper(60, 20, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1704,7 +1849,7 @@ impl App {
             }
 
             AppState::ImportingModpackId { path: _ } => {
-                let area = self.get_centered_rect(50, 20, size);
+                let area = get_centered_rect_helper(50, 20, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
@@ -1736,8 +1881,8 @@ impl App {
                 f.render_widget(help, inner_layout[3]);
             }
 
-            AppState::CreatingInstanceVersion { ref id, ref name } => {
-                let area = self.get_centered_rect(80, 80, size);
+            AppState::CreatingInstanceVersion { id, name } => {
+                let area = get_centered_rect_helper(80, 80, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1786,12 +1931,11 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Select Minecraft Version (Enter to Select, Esc to Cancel) ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = self.version_list_state.clone();
-                f.render_stateful_widget(list, chunks[1], &mut state);
+                f.render_stateful_widget(list, chunks[1], &mut self.version_list_state);
             }
 
-            AppState::AddMicrosoftAccount { ref user_code, ref verification_uri, .. } => {
-                let area = self.get_centered_rect(65, 35, size);
+            AppState::AddMicrosoftAccount { user_code, verification_uri, .. } => {
+                let area = get_centered_rect_helper(65, 35, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1838,8 +1982,8 @@ impl App {
                 f.render_widget(cancel_p, chunks[4]);
             }
 
-            AppState::EditingSetting { ref input_value, .. } => {
-                let area = self.get_centered_rect(60, 20, size);
+            AppState::EditingSetting { input_value, .. } => {
+                let area = get_centered_rect_helper(60, 20, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1872,7 +2016,7 @@ impl App {
             }
 
             AppState::SelectInstanceFieldToEdit { instance_idx: _ } => {
-                let area = self.get_centered_rect(55, 12, size);
+                let area = get_centered_rect_helper(55, 12, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -1914,8 +2058,8 @@ impl App {
                 f.render_widget(help, chunks[4]);
             }
 
-            AppState::EditingInstanceSetting { field_idx, ref input_value, .. } => {
-                let area = self.get_centered_rect(65, 12, size);
+            AppState::EditingInstanceSetting { field_idx, input_value, .. } => {
+                let area = get_centered_rect_helper(65, 12, size);
                 f.render_widget(Clear, area);
 
                 let field_name = match field_idx {
@@ -1958,7 +2102,9 @@ impl App {
                 f.render_widget(help, chunks[2]);
             }
 
-            AppState::Downloading { completed, total, ref current_file, ref message, ref logs, .. } => {
+            AppState::Downloading { completed, total, current_file, message, logs, .. } => {
+                let completed = *completed;
+                let total = *total;
                 f.render_widget(Clear, size); 
                 
                 let block = Block::default()
@@ -2007,7 +2153,9 @@ impl App {
                 f.render_widget(log_list, chunks[2]);
             }
 
-            AppState::SyncingInstanceMods { completed, total, ref current_file, ref message, ref logs, .. } => {
+            AppState::SyncingInstanceMods { completed, total, current_file, message, logs, .. } => {
+                let completed = *completed;
+                let total = *total;
                 f.render_widget(Clear, size);
                 
                 let block = Block::default()
@@ -2052,7 +2200,9 @@ impl App {
                 f.render_widget(log_list, chunks[2]);
             }
 
-            AppState::ImportingModpackProgress { completed, total, ref current_file, ref message, ref logs, .. } => {
+            AppState::ImportingModpackProgress { completed, total, current_file, message, logs, .. } => {
+                let completed = *completed;
+                let total = *total;
                 f.render_widget(Clear, size);
                 
                 let block = Block::default()
@@ -2097,8 +2247,9 @@ impl App {
                 f.render_widget(log_list, chunks[2]);
             }
 
-            AppState::BackupsMenu { instance_idx, ref backups, ref backups_list_state } => {
-                let area = self.get_centered_rect(70, 70, size);
+            AppState::BackupsMenu { instance_idx, backups, backups_list_state } => {
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(70, 70, size);
                 f.render_widget(Clear, area);
 
                 let inst = &self.instances[instance_idx];
@@ -2126,16 +2277,15 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Created Snapshots ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = backups_list_state.clone();
-                f.render_stateful_widget(list, chunks[0], &mut state);
+                f.render_stateful_widget(list, chunks[0], backups_list_state);
 
                 let help_p = Paragraph::new("Press [B] to Create New Backup\nPress [Enter] to Restore Selected Backup\nPress [Esc] to Close Menu")
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
                 f.render_widget(help_p, chunks[1]);
             }
-            AppState::ChoosingModLoader { instance_id: _, ref instance_name, ref game_version, ref loader_options, ref loader_list_state } => {
-                let area = self.get_centered_rect(60, 60, size);
+            AppState::ChoosingModLoader { instance_id: _, instance_name, game_version, loader_options, loader_list_state } => {
+                let area = get_centered_rect_helper(60, 60, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
@@ -2162,8 +2312,7 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Select a Loader ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = loader_list_state.clone();
-                f.render_stateful_widget(list, chunks[0], &mut state);
+                f.render_stateful_widget(list, chunks[0], loader_list_state);
 
                 let help_p = Paragraph::new("Press [Enter] to Select, [Esc] to Skip (Vanilla)")
                     .alignment(ratatui::layout::Alignment::Center)
@@ -2171,8 +2320,9 @@ impl App {
                 f.render_widget(help_p, chunks[1]);
             }
 
-            AppState::ModManager { instance_idx, ref mods, ref mod_list_state } => {
-                let area = self.get_centered_rect(80, 80, size);
+            AppState::ModManager { instance_idx, mods, mod_list_state } => {
+                let instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(80, 80, size);
                 f.render_widget(Clear, area);
 
                 let inst_name = self.instances.get(instance_idx)
@@ -2192,6 +2342,7 @@ impl App {
                     .constraints([
                         Constraint::Min(4),
                         Constraint::Length(4),
+                        Constraint::Length(2),
                     ])
                     .split(inner);
 
@@ -2210,8 +2361,7 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(" Installed Mods ").border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
-                let mut state = mod_list_state.clone();
-                f.render_stateful_widget(list, chunks[0], &mut state);
+                f.render_stateful_widget(list, chunks[0], mod_list_state);
 
                 // Show description of selected mod
                 let desc_text = if let Some(idx) = mod_list_state.selected() {
@@ -2229,31 +2379,231 @@ impl App {
                     .wrap(Wrap { trim: true })
                     .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(border_color)));
                 f.render_widget(desc_p, chunks[1]);
+
+                let help_text = "Press [Space/Enter] to toggle, [a] to search/add mod, [d/Backspace] to delete, [Esc] to back";
+                let help_p = Paragraph::new(help_text)
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(help_p, chunks[2]);
+            }
+
+            AppState::SearchingModQuery { instance_idx: _ } => {
+                let area = get_centered_rect_helper(60, 20, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Search Modrinth Mods ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Length(3), 
+                        Constraint::Length(2), 
+                    ])
+                    .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+                f.render_widget(Paragraph::new("Enter mod name or query:"), inner_layout[1]);
+
+                let input_p = Paragraph::new(self.version_search_query.clone()) 
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+                f.render_widget(input_p, inner_layout[2]);
+
+                let help = Paragraph::new("Press [Enter] to Search, [Esc] to Back")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, inner_layout[3]);
+            }
+
+            AppState::SearchingModLoading { query, .. } => {
+                let area = get_centered_rect_helper(50, 15, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Searching Modrinth ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let p = Paragraph::new(format!("\nSearching for \"{}\"...\nPlease wait.", query))
+                    .style(Style::default().fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, inner);
+            }
+
+            AppState::SearchingModResults { query, hits, list_state, .. } => {
+                let area = get_centered_rect_helper(85, 85, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Modrinth Search: \"{}\" ", query))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(6), 
+                        Constraint::Length(3),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = hits.iter().map(|hit| {
+                    let item_line = Line::from(vec![
+                        Span::styled(format!(" {:<30}", hit.title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" By: {:<15}", hit.author), Style::default().fg(Color::Rgb(150, 150, 150))),
+                        Span::styled(format!(" Downloads: {:<12}", hit.downloads), Style::default().fg(Color::Cyan)),
+                    ]);
+                    ListItem::new(item_line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Matching Mods ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], list_state);
+
+                let desc_text = if let Some(idx) = list_state.selected() {
+                    if let Some(hit) = hits.get(idx) {
+                        format!("{}\n{}", hit.title, hit.description)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    "No mod selected.".to_string()
+                };
+
+                let desc_p = Paragraph::new(desc_text)
+                    .style(Style::default().fg(Color::Rgb(180, 180, 200)))
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL).title(" Mod Info ").border_style(Style::default().fg(border_color)));
+                f.render_widget(desc_p, chunks[1]);
+
+                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to select version, [Esc] to Search Query")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, chunks[2]);
+            }
+
+            AppState::SearchingModVersionsLoading { hit, .. } => {
+                let area = get_centered_rect_helper(50, 15, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Fetching Versions ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let p = Paragraph::new(format!("\nFetching versions for \"{}\"...\nPlease wait.", hit.title))
+                    .style(Style::default().fg(Color::White))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, inner);
+            }
+
+            AppState::SearchingModVersions { hit, versions, list_state, .. } => {
+                let area = get_centered_rect_helper(75, 75, size);
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .title(format!(" Compatible Versions for \"{}\" ", hit.title))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(10),
+                        Constraint::Length(3),
+                    ])
+                    .split(inner);
+
+                let list_items: Vec<ListItem> = versions.iter().map(|ver| {
+                    let game_vers = ver.game_versions.join(", ");
+                    let loaders = ver.loaders.join(", ");
+                    let item_line = Line::from(vec![
+                        Span::styled(format!(" {:<30}", ver.name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" Game Versions: {} | Loaders: {}", game_vers, loaders), Style::default().fg(Color::Cyan)),
+                    ]);
+                    ListItem::new(item_line)
+                }).collect();
+
+                let list = List::new(list_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Available Versions ").border_style(Style::default().fg(border_color)))
+                    .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
+
+                f.render_stateful_widget(list, chunks[0], list_state);
+
+                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to install mod, [Esc] to Cancel")
+                    .style(Style::default().fg(Color::Rgb(150, 150, 150)))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(help, chunks[1]);
+            }
+
+            AppState::InstallingModProgress { completed, total, current_file, message, .. } => {
+                let completed = *completed;
+                let total = *total;
+                f.render_widget(Clear, size);
+                
+                let block = Block::default()
+                    .title(" Installing Mod & Dependencies ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan));
+                f.render_widget(block, size);
+
+                let inner = size.inner(&ratatui::layout::Margin { horizontal: 3, vertical: 2 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), 
+                        Constraint::Length(3), 
+                        Constraint::Min(4),    
+                    ])
+                    .split(inner);
+
+                let pct = if total > 0 { (completed * 100) / total } else { 0 };
+                let title_text = format!("{} Progress: {}% ({}/{})", message, pct, completed, total);
+                let current_p = Paragraph::new(format!("{}\nFile/Mod: {}", title_text, current_file))
+                    .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+                f.render_widget(current_p, chunks[0]);
+
+                let inner_width = chunks[1].width as usize - 2;
+                let filled_chars = if total > 0 { (completed * inner_width) / total } else { 0 };
+                let mut bar = String::new();
+                for _ in 0..filled_chars { bar.push('█'); }
+                for _ in filled_chars..inner_width { bar.push('░'); }
+                let bar_p = Paragraph::new(bar)
+                    .style(Style::default().fg(Color::Cyan))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
+                f.render_widget(bar_p, chunks[1]);
+
+                let status_card = Paragraph::new("\nPlease wait while MineCLI resolves dependencies\nand completes installation.")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(150, 150, 160)));
+                f.render_widget(status_card, chunks[2]);
             }
 
             AppState::GameRunning { .. } => {}
         }
     }
 
-    fn get_centered_rect(&self, percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-        let popup_layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage((100 - percent_y) / 2),
-                Constraint::Percentage(percent_y),
-                Constraint::Percentage((100 - percent_y) / 2),
-            ])
-            .split(r);
-
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage((100 - percent_x) / 2),
-                Constraint::Percentage(percent_x),
-                Constraint::Percentage((100 - percent_x) / 2),
-            ])
-            .split(popup_layout[1])[1]
-    }
 
     async fn handle_key(&mut self, key: KeyEvent) -> bool {
         match self.state {
@@ -3199,7 +3549,6 @@ impl App {
                             self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
                         }
                         KeyCode::Enter | KeyCode::Char(' ') => {
-                            // Toggle enabled/disabled
                             if let Some(selected) = mod_list_state.selected()
                                 && let Some(inst) = self.instances.get(instance_idx)
                                     && let Some(m) = mods.get_mut(selected) {
@@ -3218,12 +3567,246 @@ impl App {
                                     }
                             self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
                         }
+                        KeyCode::Char('a') => {
+                            self.version_search_query.clear();
+                            self.state = AppState::SearchingModQuery { instance_idx };
+                        }
+                        KeyCode::Char('d') | KeyCode::Backspace => {
+                            if let Some(selected) = mod_list_state.selected()
+                                && let Some(inst) = self.instances.get(instance_idx)
+                                && let Some(m) = mods.get(selected) {
+                                    let mut inst_mut = inst.clone();
+                                    let filename = m.filename.clone();
+                                    let mod_name = m.metadata.name.clone();
+                                    if let Err(e) = inst_mut.remove_mod(&filename, true) {
+                                        self.status_message = Some((format!("Failed to delete mod: {}", e), true));
+                                    } else {
+                                        self.status_message = Some((format!("Deleted mod '{}'", mod_name), false));
+                                    }
+                                    if let Ok(new_mods) = inst_mut.get_mods() {
+                                        mods = new_mods;
+                                        if selected >= mods.len() && !mods.is_empty() {
+                                            mod_list_state.select(Some(mods.len() - 1));
+                                        } else if mods.is_empty() {
+                                            mod_list_state.select(None);
+                                        }
+                                    }
+                                }
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        }
                         _ => {
                             self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
                         }
                     }
                 }
             }
+
+            AppState::SearchingModQuery { instance_idx } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        if let Some(inst) = self.instances.get(instance_idx) {
+                            if let Ok(mods) = inst.get_mods() {
+                                let mut mod_list_state = ListState::default();
+                                if !mods.is_empty() {
+                                    mod_list_state.select(Some(0));
+                                }
+                                self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                            } else {
+                                self.state = AppState::Normal;
+                            }
+                        } else {
+                            self.state = AppState::Normal;
+                        }
+                        self.version_search_query.clear();
+                    }
+                    KeyCode::Enter => {
+                        let query = self.version_search_query.trim().to_string();
+                        if !query.is_empty() {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            let client = self.api_client.clone();
+                            let query_clone = query.clone();
+                            if let Some(inst) = self.instances.get(instance_idx) {
+                                let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
+                                tokio::spawn(async move {
+                                    let res = client.search_mods(&query_clone, Some(&game_version), loader.as_deref()).await;
+                                    let _ = tx.send(res);
+                                });
+                                self.state = AppState::SearchingModLoading { instance_idx, query, rx };
+                            }
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        self.version_search_query.push(c);
+                    }
+                    KeyCode::Backspace => {
+                        self.version_search_query.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModLoading { .. } => {}
+
+            AppState::SearchingModResults { instance_idx, ref query, ref hits, ref mut list_state } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        let q = query.clone();
+                        self.state = AppState::SearchingModQuery { instance_idx };
+                        self.version_search_query = q;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected + 1 < hits.len() {
+                            list_state.select(Some(selected + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = list_state.selected()
+                            && let Some(hit) = hits.get(idx) {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let client = self.api_client.clone();
+                                let project_id = hit.project_id.clone();
+                                tokio::spawn(async move {
+                                    let res = client.fetch_modpack_versions(&project_id).await;
+                                    let _ = tx.send(res);
+                                });
+                                self.state = AppState::SearchingModVersionsLoading { instance_idx, hit: hit.clone(), rx };
+                            }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::SearchingModVersionsLoading { .. } => {}
+
+            AppState::SearchingModVersions { instance_idx, hit: _, ref versions, ref mut list_state } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        let client = self.api_client.clone();
+                        let query = self.version_search_query.clone();
+                        let query_clone = query.clone();
+                        if let Some(inst) = self.instances.get(instance_idx) {
+                            let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
+                            tokio::spawn(async move {
+                                let res = client.search_mods(&query_clone, Some(&game_version), loader.as_deref()).await;
+                                let _ = tx.send(res);
+                            });
+                            self.state = AppState::SearchingModLoading { instance_idx, query, rx };
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected > 0 {
+                            list_state.select(Some(selected - 1));
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let selected = list_state.selected().unwrap_or(0);
+                        if selected + 1 < versions.len() {
+                            list_state.select(Some(selected + 1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(idx) = list_state.selected()
+                            && let Some(version) = versions.get(idx) {
+                                let (tx, rx) = mpsc::channel::<ProgressUpdate>(100);
+                                let game_dir = self.config.game_dir.clone();
+                                let api = self.api_client.clone();
+                                let mut inst = self.instances[instance_idx].clone();
+                                
+                                let version_id = version.id.clone();
+                                let version_files = version.files.clone();
+                                let dependencies = version.dependencies.clone();
+                                
+                                let (game_version, loader) = inst.get_game_version_and_loader(&game_dir);
+                                let game_version_clone = game_version.clone();
+                                let loader_clone = loader.clone();
+
+                                tokio::spawn(async move {
+                                    let _ = tx.send(ProgressUpdate::Started {
+                                        total: 1 + dependencies.len(),
+                                        message: "Installing mod...".to_string(),
+                                    }).await;
+
+                                    if let Some(file) = version_files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| version_files.first()) {
+                                        let _ = tx.send(ProgressUpdate::Progress {
+                                            completed: 0,
+                                            total: 1 + dependencies.len(),
+                                            current_file: file.filename.clone(),
+                                        }).await;
+
+                                        if let Err(e) = inst.install_mod_from_url(&game_dir, &file.filename, &file.url, None, true).await {
+                                            let _ = tx.send(ProgressUpdate::Error(format!("Failed to install mod {}: {}", file.filename, e))).await;
+                                            return;
+                                        }
+                                    }
+
+                                    let mut completed = 1;
+                                    let mut installed_projects = std::collections::HashSet::new();
+                                    installed_projects.insert(version_id);
+
+                                    for dep in dependencies {
+                                        if dep.dependency_type == "required" {
+                                            if let Some(dep_project_id) = dep.project_id {
+                                                if installed_projects.contains(&dep_project_id) {
+                                                    continue;
+                                                }
+
+                                                let dep_name = match api.fetch_project(&dep_project_id).await {
+                                                    Ok(p) => p.title,
+                                                    Err(_) => dep_project_id.clone(),
+                                                };
+
+                                                let _ = tx.send(ProgressUpdate::Progress {
+                                                    completed,
+                                                    total: 1 + completed,
+                                                    current_file: format!("Dependency: {}", dep_name),
+                                                }).await;
+
+                                                if let Ok(dep_versions) = api.fetch_modpack_versions(&dep_project_id).await {
+                                                    let comp_ver = dep_versions.into_iter().find(|v| {
+                                                        v.game_versions.contains(&game_version_clone) && match loader_clone.as_deref() {
+                                                            Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+                                                            None => true,
+                                                        }
+                                                    });
+
+                                                    if let Some(cv) = comp_ver {
+                                                        if let Some(dep_file) = cv.files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| cv.files.first()) {
+                                                            let _ = inst.install_mod_from_url(&game_dir, &dep_file.filename, &dep_file.url, None, true).await;
+                                                        }
+                                                    }
+                                                }
+                                                completed += 1;
+                                            }
+                                        }
+                                    }
+
+                                    let _ = tx.send(ProgressUpdate::Finished).await;
+                                });
+
+                                self.state = AppState::InstallingModProgress {
+                                    instance_idx,
+                                    completed: 0,
+                                    total: 1,
+                                    current_file: String::new(),
+                                    message: "Initializing...".to_string(),
+                                    rx,
+                                };
+                            }
+                    }
+                    _ => {}
+                }
+            }
+
+            AppState::InstallingModProgress { .. } => {}
 
             AppState::Downloading { .. } | AppState::SyncingInstanceMods { .. } | AppState::ImportingModpackProgress { .. } => {}
         }
@@ -3454,4 +4037,24 @@ pub async fn run_tui() -> Result<(), String> {
     terminal.show_cursor().map_err(|e| format!("Failed to show cursor: {}", e))?;
     
     Ok(())
+}
+
+fn get_centered_rect_helper(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
