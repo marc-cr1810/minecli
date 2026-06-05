@@ -520,6 +520,71 @@ impl Instance {
         Ok(())
     }
 
+    pub async fn install_asset_from_url(
+        &mut self,
+        game_dir: &Path,
+        filename: &str,
+        url: &str,
+        sha1: Option<&str>,
+        asset_type: &str,
+        world_name: Option<&str>,
+    ) -> Result<(), String> {
+        let (sub_dir, ext) = match asset_type {
+            "shaderpack" => ("shaderpacks", "zip"),
+            "resourcepack" => ("resourcepacks", "zip"),
+            "datapack" => {
+                let w = world_name.ok_or_else(|| "World name required for datapacks".to_string())?;
+                (w, "zip")
+            }
+            _ => return Err(format!("Unknown asset type: {}", asset_type)),
+        };
+
+        let cache_dir = game_dir.join("cache").join(asset_type);
+        
+        let target_dir = if asset_type == "datapack" {
+            self.path.join("saves").join(sub_dir).join("datapacks")
+        } else {
+            self.path.join(sub_dir)
+        };
+
+        fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+
+        let cache_filename = if let Some(s) = sha1 {
+            format!("{}.{}", s, ext)
+        } else {
+            use sha1::{Sha1, Digest};
+            let mut hasher = Sha1::new();
+            hasher.update(url.as_bytes());
+            format!("{:x}.{}", hasher.finalize(), ext)
+        };
+
+        let cache_path = cache_dir.join(&cache_filename);
+        let target_filename = if filename.ends_with(".zip") { filename.to_string() } else { format!("{}.zip", filename) };
+        let target_path = target_dir.join(&target_filename);
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(10);
+        let downloader = crate::downloader::Downloader::new(tx);
+        downloader.download_file(url, &cache_path, sha1.unwrap_or("")).await?;
+
+        if target_path.exists() {
+            let _ = fs::remove_file(&target_path);
+        }
+        
+        let disabled_target_filename = format!("{}.disabled", target_filename);
+        let disabled_target_path = target_dir.join(&disabled_target_filename);
+        if disabled_target_path.exists() {
+            let _ = fs::remove_file(&disabled_target_path);
+        }
+
+        if fs::hard_link(&cache_path, &target_path).is_err() {
+            fs::copy(&cache_path, &target_path)
+                .map_err(|e| format!("Failed to copy asset to instance: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     pub fn remove_mod(&mut self, filename_or_id: &str, delete_from_toml: bool) -> Result<(), String> {
         let mods_dir = self.path.join("mods");
         let mods = self.get_mods()?;

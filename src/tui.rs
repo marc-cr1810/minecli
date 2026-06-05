@@ -32,6 +32,14 @@ enum MicrosoftAuthUpdate {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetSearchType {
+    Mod,
+    Shader,
+    ResourcePack,
+    Datapack { world_name: String },
+}
+
 enum AppState {
     Normal,
     AddOfflineAccount,
@@ -147,31 +155,37 @@ enum AppState {
     },
     SearchingModQuery {
         instance_idx: usize,
+        search_type: AssetSearchType,
     },
     SearchingModLoading {
         instance_idx: usize,
+        search_type: AssetSearchType,
         query: String,
         rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthSearchHit>, String>>,
     },
     SearchingModResults {
         instance_idx: usize,
+        search_type: AssetSearchType,
         query: String,
         hits: Vec<crate::api::ModrinthSearchHit>,
         list_state: ListState,
     },
     SearchingModVersionsLoading {
         instance_idx: usize,
+        search_type: AssetSearchType,
         hit: crate::api::ModrinthSearchHit,
         rx: tokio::sync::oneshot::Receiver<Result<Vec<crate::api::ModrinthVersion>, String>>,
     },
     SearchingModVersions {
         instance_idx: usize,
+        search_type: AssetSearchType,
         hit: crate::api::ModrinthSearchHit,
         versions: Vec<crate::api::ModrinthVersion>,
         list_state: ListState,
     },
     InstallingModProgress {
         instance_idx: usize,
+        search_type: AssetSearchType,
         completed: usize,
         total: usize,
         current_file: String,
@@ -188,6 +202,10 @@ enum AppState {
         worlds: Vec<crate::assets::WorldInfo>,
         list_state: ListState,
         confirm_delete: Option<String>,
+    },
+    PromptWorldNameForDatapack {
+        instance_idx: usize,
+        input_value: String,
     },
     ResourcePackManager {
         instance_idx: usize,
@@ -214,6 +232,12 @@ enum AppState {
         screenshots: Vec<crate::assets::ScreenshotInfo>,
         list_state: ListState,
         confirm_delete: Option<String>,
+    },
+    PromptRenameAsset {
+        instance_idx: usize,
+        asset_type: String,
+        old_filename: String,
+        input_value: String,
     },
 }
 
@@ -643,33 +667,33 @@ impl App {
 
         // 3e. Process Modrinth Mod search results
         let mut mod_search_finished_state = None;
-        if let AppState::SearchingModLoading { instance_idx, ref query, ref mut rx } = self.state
+        if let AppState::SearchingModLoading { instance_idx, ref search_type, ref query, ref mut rx } = self.state
             && let Ok(res) = rx.try_recv() {
-                mod_search_finished_state = Some((instance_idx, query.clone(), res));
+                mod_search_finished_state = Some((instance_idx, search_type.clone(), query.clone(), res));
             }
-        if let Some((instance_idx, query, res)) = mod_search_finished_state {
+        if let Some((instance_idx, search_type, query, res)) = mod_search_finished_state {
             match res {
                 Ok(hits) => {
                     let mut list_state = ListState::default();
                     if !hits.is_empty() {
                         list_state.select(Some(0));
                     }
-                    self.state = AppState::SearchingModResults { instance_idx, query, hits, list_state };
+                    self.state = AppState::SearchingModResults { instance_idx, search_type, query, hits, list_state };
                 }
                 Err(e) => {
                     self.status_message = Some((format!("Search failed: {}", e), true));
-                    self.state = AppState::SearchingModQuery { instance_idx };
+                    self.state = AppState::SearchingModQuery { instance_idx, search_type };
                 }
             }
         }
 
         // 3f. Process Modrinth Mod version results
         let mut mod_versions_finished_state = None;
-        if let AppState::SearchingModVersionsLoading { instance_idx, ref hit, ref mut rx } = self.state
+        if let AppState::SearchingModVersionsLoading { instance_idx, ref search_type, ref hit, ref mut rx } = self.state
             && let Ok(res) = rx.try_recv() {
-                mod_versions_finished_state = Some((instance_idx, hit.clone(), res));
+                mod_versions_finished_state = Some((instance_idx, search_type.clone(), hit.clone(), res));
             }
-        if let Some((instance_idx, hit, res)) = mod_versions_finished_state {
+        if let Some((instance_idx, search_type, hit, res)) = mod_versions_finished_state {
             match res {
                 Ok(versions) => {
                     let mut list_state = ListState::default();
@@ -677,19 +701,22 @@ impl App {
                         let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
                         let compatible_versions: Vec<crate::api::ModrinthVersion> = versions.into_iter().filter(|v| {
                             let matches_game = v.game_versions.contains(&game_version);
-                            let matches_loader = match loader.as_deref() {
-                                Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
-                                None => true,
+                            let matches_loader = match search_type {
+                                AssetSearchType::Mod => match loader.as_deref() {
+                                    Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+                                    None => true,
+                                },
+                                _ => true, // Category/loader-independent search for shaders, packs, datapacks
                             };
                             matches_game && matches_loader
                         }).collect();
 
                         if compatible_versions.is_empty() {
                             self.status_message = Some((format!("No compatible versions found for Minecraft {} ({}).", game_version, loader.as_deref().unwrap_or("vanilla")), true));
-                            self.state = AppState::SearchingModQuery { instance_idx };
+                            self.state = AppState::SearchingModQuery { instance_idx, search_type };
                         } else {
                             list_state.select(Some(0));
-                            self.state = AppState::SearchingModVersions { instance_idx, hit, versions: compatible_versions, list_state };
+                            self.state = AppState::SearchingModVersions { instance_idx, search_type, hit, versions: compatible_versions, list_state };
                         }
                     } else {
                         self.state = AppState::Normal;
@@ -704,7 +731,7 @@ impl App {
 
         // 3g. Process Mod Installation progress updates
         let mut mod_install_finished_state = None;
-        if let AppState::InstallingModProgress { instance_idx, ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut rx } = self.state {
+        if let AppState::InstallingModProgress { instance_idx, ref search_type, ref mut completed, ref mut total, ref mut current_file, ref mut message, ref mut rx } = self.state {
             while let Ok(update) = rx.try_recv() {
                 match update {
                     ProgressUpdate::Started { total: t, message: msg } => {
@@ -721,32 +748,67 @@ impl App {
                         *message = msg;
                     }
                     ProgressUpdate::Finished => {
-                        mod_install_finished_state = Some((instance_idx, Ok(())));
+                        mod_install_finished_state = Some((instance_idx, search_type.clone(), Ok(())));
                     }
                     ProgressUpdate::Error(e) => {
-                        mod_install_finished_state = Some((instance_idx, Err(e)));
+                        mod_install_finished_state = Some((instance_idx, search_type.clone(), Err(e)));
                     }
                 }
             }
         }
-        if let Some((instance_idx, res)) = mod_install_finished_state {
+        if let Some((instance_idx, search_type, res)) = mod_install_finished_state {
+            let asset_name = match search_type {
+                AssetSearchType::Mod => "Mod",
+                AssetSearchType::Shader => "Shader pack",
+                AssetSearchType::ResourcePack => "Resource pack",
+                AssetSearchType::Datapack { .. } => "Datapack",
+            };
             match res {
                 Ok(_) => {
-                    self.status_message = Some(("Mod installed successfully!".to_string(), false));
+                    self.status_message = Some((format!("{} installed successfully!", asset_name), false));
                 }
                 Err(e) => {
-                    self.status_message = Some((format!("Failed to install mod: {}", e), true));
+                    self.status_message = Some((format!("Failed to install {}: {}", asset_name.to_lowercase(), e), true));
                 }
             }
             if let Some(inst) = self.instances.get(instance_idx) {
-                if let Ok(mods) = inst.get_mods() {
-                    let mut mod_list_state = ListState::default();
-                    if !mods.is_empty() {
-                        mod_list_state.select(Some(0));
+                match search_type {
+                    AssetSearchType::Mod => {
+                        if let Ok(mods) = inst.get_mods() {
+                            let mut mod_list_state = ListState::default();
+                            if !mods.is_empty() {
+                                mod_list_state.select(Some(0));
+                            }
+                            self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                        } else {
+                            self.state = AppState::Normal;
+                        }
                     }
-                    self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
-                } else {
-                    self.state = AppState::Normal;
+                    AssetSearchType::Shader => {
+                        let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                        let mut list_state = ListState::default();
+                        if !shaders.is_empty() {
+                            list_state.select(Some(0));
+                        }
+                        let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                        self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                    }
+                    AssetSearchType::ResourcePack => {
+                        let packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                        let mut list_state = ListState::default();
+                        if !packs.is_empty() {
+                            list_state.select(Some(0));
+                        }
+                        self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                    }
+                    AssetSearchType::Datapack { .. } => {
+                        let worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                        let mut list_state = ListState::default();
+                        if !worlds.is_empty() {
+                            list_state.select(Some(0));
+                        }
+                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                    }
                 }
             } else {
                 self.state = AppState::Normal;
@@ -2517,7 +2579,7 @@ impl App {
 
                 f.render_stateful_widget(list, chunks[0], list_state);
 
-                let help_text = "Press [Up/Down] to navigate, [b] to backup (ZIP), [d] to delete, [Esc] to back";
+                let help_text = "Press [Up/Down] to navigate, [a] to add datapack, [p] to pre-provision, [b] to backup, [r] to rename, [d] to delete, [Esc] to back";
                 let help_p = Paragraph::new(help_text)
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
@@ -2554,6 +2616,46 @@ impl App {
                 }
             }
 
+            AppState::PromptWorldNameForDatapack { instance_idx, input_value } => {
+                let _instance_idx = *instance_idx;
+                let area = get_centered_rect_helper(50, 25, size);
+                f.render_widget(Clear, area);
+                
+                let block = Block::default()
+                    .title(" Pre-provision Datapack ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                f.render_widget(Paragraph::new("Enter the name of the new world to create/pre-provision:")
+                    .style(Style::default().fg(Color::White)), chunks[0]);
+
+                let input_widget = Paragraph::new(format!(" > {}", input_value))
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)))
+                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                f.render_widget(input_widget, chunks[1]);
+
+                let info_msg = "MineCLI will automatically create the required folder structure:\nsaves/<world_name>/datapacks/\nand download the chosen datapack there.";
+                f.render_widget(Paragraph::new(info_msg).style(Style::default().fg(Color::Rgb(150, 150, 160))), chunks[2]);
+
+                let help_p = Paragraph::new("Press [Enter] to Search/Install, [Esc] to Cancel")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(120, 120, 130)));
+                f.render_widget(help_p, chunks[3]);
+            }
+
             AppState::ResourcePackManager { instance_idx, packs, list_state } => {
                 let instance_idx = *instance_idx;
                 let area = get_centered_rect_helper(80, 80, size);
@@ -2583,12 +2685,22 @@ impl App {
                     let status = if p.enabled { "✓" } else { "✗" };
                     let status_color = if p.enabled { Color::Green } else { Color::Red };
                     let size_mb = (p.size_bytes as f64) / (1024.0 * 1024.0);
-                    let line = Line::from(vec![
-                        Span::styled(format!(" [{}] ", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-                        Span::styled(&p.filename, Style::default().fg(Color::White)),
-                        Span::styled(format!("  Size: {:.2} MB", size_mb), Style::default().fg(Color::Rgb(140, 140, 150))),
-                    ]);
-                    ListItem::new(line)
+                    
+                    let mut lines = vec![
+                        Line::from(vec![
+                            Span::styled(format!(" [{}] ", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                            Span::styled(&p.filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("  Size: {:.2} MB", size_mb), Style::default().fg(Color::Rgb(140, 140, 150))),
+                        ])
+                    ];
+
+                    if let Some(ref desc) = p.description {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("      ↳ {}", desc), Style::default().fg(Color::Rgb(170, 170, 180))),
+                        ]));
+                    }
+
+                    ListItem::new(lines)
                 }).collect();
 
                 let list = List::new(list_items)
@@ -2597,7 +2709,7 @@ impl App {
 
                 f.render_stateful_widget(list, chunks[0], list_state);
 
-                let help_text = "Press [Space/Enter] to toggle enable/disable, [Esc] to back";
+                let help_text = "Press [Space/Enter] to toggle, [a] to search/add, [r] to rename, [d/Backspace] to delete, [Esc] to back";
                 let help_p = Paragraph::new(help_text)
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
@@ -2660,7 +2772,7 @@ impl App {
                 f.render_stateful_widget(list, chunks[1], list_state);
 
                 let help_text = if has_shader_support {
-                    "Press [Space/Enter] to toggle enable/disable, [Esc] to back"
+                    "Press [Space/Enter] to toggle, [a] to search/add, [r] to rename, [d/Backspace] to delete, [Esc] to back"
                 } else {
                     "Press [i/I] to install shader compatibility mod, [Esc] to back"
                 };
@@ -2668,6 +2780,58 @@ impl App {
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
                 f.render_widget(help_p, chunks[2]);
+            }
+
+            AppState::PromptRenameAsset { instance_idx: _, asset_type, old_filename: _, input_value } => {
+                let area = get_centered_rect_helper(50, 25, size);
+                f.render_widget(Clear, area);
+                
+                let title = match asset_type.as_str() {
+                    "world" => " Rename World ",
+                    "resourcepack" => " Rename Resource Pack ",
+                    "shaderpack" => " Rename Shader Pack ",
+                    _ => " Rename Asset ",
+                };
+
+                let block = Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(select_color));
+                f.render_widget(block, area);
+
+                let inner = area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 });
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                        Constraint::Length(2),
+                    ])
+                    .split(inner);
+
+                let label = match asset_type.as_str() {
+                    "world" => "Enter new world folder name:",
+                    "resourcepack" => "Enter new resource pack filename (excluding extension):",
+                    "shaderpack" => "Enter new shader pack filename (excluding extension):",
+                    _ => "Enter new name:",
+                };
+                f.render_widget(Paragraph::new(label)
+                    .style(Style::default().fg(Color::White)), chunks[0]);
+
+                let input_widget = Paragraph::new(format!(" > {}", input_value))
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)))
+                    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+                f.render_widget(input_widget, chunks[1]);
+
+                let info_msg = "Renaming the file directly renames the pack for Minecraft.\nExtensions and enabled/disabled states are automatically preserved.";
+                f.render_widget(Paragraph::new(info_msg).style(Style::default().fg(Color::Rgb(150, 150, 160))), chunks[2]);
+
+                let help_p = Paragraph::new("Press [Enter] to Rename, [Esc] to Cancel")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::Rgb(120, 120, 130)));
+                f.render_widget(help_p, chunks[3]);
             }
 
             AppState::InstallingShaderSupport { instance_idx: _, completed, total, current_file, message, logs, rx: _ } => {
@@ -2857,12 +3021,18 @@ impl App {
                 f.render_widget(help_p, chunks[2]);
             }
 
-            AppState::SearchingModQuery { instance_idx: _ } => {
+            AppState::SearchingModQuery { instance_idx: _, search_type } => {
+                let (asset_title, asset_label) = match search_type {
+                    AssetSearchType::Mod => ("Mods", "mod"),
+                    AssetSearchType::Shader => ("Shaders", "shader"),
+                    AssetSearchType::ResourcePack => ("Resource Packs", "resource pack"),
+                    AssetSearchType::Datapack { .. } => ("Datapacks", "datapack"),
+                };
                 let area = get_centered_rect_helper(60, 20, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
-                    .title(" Search Modrinth Mods ")
+                    .title(format!(" Search Modrinth {} ", asset_title))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(select_color));
@@ -2878,7 +3048,7 @@ impl App {
                     ])
                     .split(area.inner(&ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
 
-                f.render_widget(Paragraph::new("Enter mod name or query:"), inner_layout[1]);
+                f.render_widget(Paragraph::new(format!("Enter {} name or query:", asset_label)), inner_layout[1]);
 
                 let input_p = Paragraph::new(self.version_search_query.clone()) 
                     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
@@ -2890,12 +3060,18 @@ impl App {
                 f.render_widget(help, inner_layout[3]);
             }
 
-            AppState::SearchingModLoading { query, .. } => {
+            AppState::SearchingModLoading { query, search_type, .. } => {
+                let asset_title = match search_type {
+                    AssetSearchType::Mod => "Mods",
+                    AssetSearchType::Shader => "Shaders",
+                    AssetSearchType::ResourcePack => "Resource Packs",
+                    AssetSearchType::Datapack { .. } => "Datapacks",
+                };
                 let area = get_centered_rect_helper(50, 15, size);
                 f.render_widget(Clear, area);
                 
                 let block = Block::default()
-                    .title(" Searching Modrinth ")
+                    .title(format!(" Searching Modrinth {} ", asset_title))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan));
@@ -2908,12 +3084,18 @@ impl App {
                 f.render_widget(p, inner);
             }
 
-            AppState::SearchingModResults { query, hits, list_state, .. } => {
+            AppState::SearchingModResults { query, search_type, hits, list_state, .. } => {
+                let asset_title = match search_type {
+                    AssetSearchType::Mod => "Mods",
+                    AssetSearchType::Shader => "Shaders",
+                    AssetSearchType::ResourcePack => "Resource Packs",
+                    AssetSearchType::Datapack { .. } => "Datapacks",
+                };
                 let area = get_centered_rect_helper(85, 85, size);
                 f.render_widget(Clear, area);
 
                 let block = Block::default()
-                    .title(format!(" Modrinth Search: \"{}\" ", query))
+                    .title(format!(" Modrinth {} Search: \"{}\" ", asset_title, query))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(select_color));
@@ -2939,7 +3121,7 @@ impl App {
                 }).collect();
 
                 let list = List::new(list_items)
-                    .block(Block::default().borders(Borders::ALL).title(" Matching Mods ").border_style(Style::default().fg(border_color)))
+                    .block(Block::default().borders(Borders::ALL).title(format!(" Matching {} ", asset_title)).border_style(Style::default().fg(border_color)))
                     .highlight_style(Style::default().bg(select_color).fg(Color::White).add_modifier(Modifier::BOLD));
 
                 f.render_stateful_widget(list, chunks[0], list_state);
@@ -2951,13 +3133,13 @@ impl App {
                         String::new()
                     }
                 } else {
-                    "No mod selected.".to_string()
+                    format!("No {} selected.", asset_title.to_lowercase())
                 };
 
                 let desc_p = Paragraph::new(desc_text)
                     .style(Style::default().fg(Color::Rgb(180, 180, 200)))
                     .wrap(Wrap { trim: true })
-                    .block(Block::default().borders(Borders::ALL).title(" Mod Info ").border_style(Style::default().fg(border_color)));
+                    .block(Block::default().borders(Borders::ALL).title(format!(" {} Info ", asset_title)).border_style(Style::default().fg(border_color)));
                 f.render_widget(desc_p, chunks[1]);
 
                 let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to select version, [Esc] to Search Query")
@@ -2984,7 +3166,13 @@ impl App {
                 f.render_widget(p, inner);
             }
 
-            AppState::SearchingModVersions { hit, versions, list_state, .. } => {
+            AppState::SearchingModVersions { hit, search_type, versions, list_state, .. } => {
+                let asset_label = match search_type {
+                    AssetSearchType::Mod => "mod",
+                    AssetSearchType::Shader => "shader pack",
+                    AssetSearchType::ResourcePack => "resource pack",
+                    AssetSearchType::Datapack { .. } => "datapack",
+                };
                 let area = get_centered_rect_helper(75, 75, size);
                 f.render_widget(Clear, area);
 
@@ -3020,19 +3208,25 @@ impl App {
 
                 f.render_stateful_widget(list, chunks[0], list_state);
 
-                let help = Paragraph::new("Press [Up/Down] to navigate, [Enter] to install mod, [Esc] to Cancel")
+                let help = Paragraph::new(format!("Press [Up/Down] to navigate, [Enter] to install {}, [Esc] to Cancel", asset_label))
                     .style(Style::default().fg(Color::Rgb(150, 150, 150)))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(help, chunks[1]);
             }
 
-            AppState::InstallingModProgress { completed, total, current_file, message, .. } => {
+            AppState::InstallingModProgress { completed, total, current_file, message, search_type, .. } => {
                 let completed = *completed;
                 let total = *total;
+                let asset_name = match search_type {
+                    AssetSearchType::Mod => "Mod",
+                    AssetSearchType::Shader => "Shader Pack",
+                    AssetSearchType::ResourcePack => "Resource Pack",
+                    AssetSearchType::Datapack { .. } => "Datapack",
+                };
                 f.render_widget(Clear, size);
                 
                 let block = Block::default()
-                    .title(" Installing Mod & Dependencies ")
+                    .title(format!(" Installing {} ", asset_name))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Cyan));
@@ -3050,7 +3244,7 @@ impl App {
 
                 let pct = if total > 0 { (completed * 100) / total } else { 0 };
                 let title_text = format!("{} Progress: {}% ({}/{})", message, pct, completed, total);
-                let current_p = Paragraph::new(format!("{}\nFile/Mod: {}", title_text, current_file))
+                let current_p = Paragraph::new(format!("{}\nFile: {}", title_text, current_file))
                     .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
                 f.render_widget(current_p, chunks[0]);
 
@@ -3064,7 +3258,7 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(100, 100, 120))));
                 f.render_widget(bar_p, chunks[1]);
 
-                let status_card = Paragraph::new("\nPlease wait while MineCLI resolves dependencies\nand completes installation.")
+                let status_card = Paragraph::new(format!("\nPlease wait while MineCLI downloads and\ninstalls the selected {}.", asset_name.to_lowercase()))
                     .alignment(ratatui::layout::Alignment::Center)
                     .style(Style::default().fg(Color::Rgb(150, 150, 160)));
                 f.render_widget(status_card, chunks[2]);
@@ -4109,6 +4303,27 @@ impl App {
                                     self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
                                 }
                             }
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(w) = worlds.get(selected) {
+                                        self.version_search_query.clear();
+                                        self.state = AppState::SearchingModQuery {
+                                            instance_idx,
+                                            search_type: AssetSearchType::Datapack { world_name: w.folder_name.clone() },
+                                        };
+                                    } else {
+                                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                    }
+                                } else {
+                                    self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                }
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                self.state = AppState::PromptWorldNameForDatapack {
+                                    instance_idx,
+                                    input_value: String::new(),
+                                };
+                            }
                             KeyCode::Char('b') | KeyCode::Char('B') => {
                                 if let Some(selected) = list_state.selected() {
                                     if let Some(w) = worlds.get(selected) {
@@ -4126,9 +4341,205 @@ impl App {
                                 }
                                 self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
                             }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                if let Some(selected) = list_state.selected() {
+                                    if let Some(w) = worlds.get(selected) {
+                                        self.state = AppState::PromptRenameAsset {
+                                            instance_idx,
+                                            asset_type: "world".to_string(),
+                                            old_filename: w.folder_name.clone(),
+                                            input_value: w.folder_name.clone(),
+                                        };
+                                    } else {
+                                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                    }
+                                } else {
+                                    self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                }
+                            }
                             _ => {
                                 self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
                             }
+                        }
+                    }
+                }
+            }
+
+            AppState::PromptWorldNameForDatapack { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::PromptWorldNameForDatapack { instance_idx, mut input_value } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            let worlds = self.instances.get(instance_idx)
+                                .map(|inst| crate::assets::list_worlds(&inst.path).unwrap_or_default())
+                                .unwrap_or_default();
+                            let mut list_state = ListState::default();
+                            if !worlds.is_empty() {
+                                list_state.select(Some(0));
+                            }
+                            self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                        }
+                        KeyCode::Enter => {
+                            let world_name = input_value.trim().to_string();
+                            if !world_name.is_empty() {
+                                self.version_search_query.clear();
+                                self.state = AppState::SearchingModQuery {
+                                    instance_idx,
+                                    search_type: AssetSearchType::Datapack { world_name },
+                                };
+                            } else {
+                                self.state = AppState::PromptWorldNameForDatapack { instance_idx, input_value };
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            input_value.push(c);
+                            self.state = AppState::PromptWorldNameForDatapack { instance_idx, input_value };
+                        }
+                        KeyCode::Backspace => {
+                            input_value.pop();
+                            self.state = AppState::PromptWorldNameForDatapack { instance_idx, input_value };
+                        }
+                        _ => {
+                            self.state = AppState::PromptWorldNameForDatapack { instance_idx, input_value };
+                        }
+                    }
+                }
+            }
+
+            AppState::PromptRenameAsset { .. } => {
+                let state = std::mem::replace(&mut self.state, AppState::Normal);
+                if let AppState::PromptRenameAsset { instance_idx, asset_type, old_filename, mut input_value } = state {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(inst) = self.instances.get(instance_idx) {
+                                match asset_type.as_str() {
+                                    "world" => {
+                                        let worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                                        let mut list_state = ListState::default();
+                                        if !worlds.is_empty() {
+                                            list_state.select(Some(0));
+                                        }
+                                        self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                    }
+                                    "resourcepack" => {
+                                        let packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                                        let mut list_state = ListState::default();
+                                        if !packs.is_empty() {
+                                            list_state.select(Some(0));
+                                        }
+                                        self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                                    }
+                                    "shaderpack" => {
+                                        let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                                        let mut list_state = ListState::default();
+                                        if !shaders.is_empty() {
+                                            list_state.select(Some(0));
+                                        }
+                                        let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                                        self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                                    }
+                                    _ => {
+                                        self.state = AppState::Normal;
+                                    }
+                                }
+                            } else {
+                                self.state = AppState::Normal;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let new_name = input_value.trim().to_string();
+                            if !new_name.is_empty() {
+                                if let Some(inst) = self.instances.get(instance_idx) {
+                                    match asset_type.as_str() {
+                                        "world" => {
+                                            let old_path = inst.path.join("saves").join(&old_filename);
+                                            let new_path = inst.path.join("saves").join(&new_name);
+                                            if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                                                self.status_message = Some((format!("Rename failed: {}", e), true));
+                                            } else {
+                                                self.status_message = Some((format!("Renamed world to '{}'", new_name), false));
+                                            }
+                                            let worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                                            let mut list_state = ListState::default();
+                                            if !worlds.is_empty() {
+                                                list_state.select(Some(0));
+                                            }
+                                            self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                        }
+                                        "resourcepack" => {
+                                            let old_path = inst.path.join("resourcepacks").join(&old_filename);
+                                            let is_disabled = old_filename.ends_with(".disabled");
+                                            let base_old = if is_disabled {
+                                                old_filename.strip_suffix(".disabled").unwrap_or(&old_filename)
+                                            } else {
+                                                &old_filename
+                                            };
+                                            let ext = std::path::Path::new(base_old).extension().and_then(|s| s.to_str()).unwrap_or("zip");
+                                            let mut target_name = format!("{}.{}", new_name, ext);
+                                            if is_disabled {
+                                                target_name.push_str(".disabled");
+                                            }
+                                            let new_path = inst.path.join("resourcepacks").join(&target_name);
+                                            if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                                                self.status_message = Some((format!("Rename failed: {}", e), true));
+                                            } else {
+                                                self.status_message = Some((format!("Renamed pack to '{}'", target_name), false));
+                                            }
+                                            let packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                                            let mut list_state = ListState::default();
+                                            if !packs.is_empty() {
+                                                list_state.select(Some(0));
+                                            }
+                                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                                        }
+                                        "shaderpack" => {
+                                            let old_path = inst.path.join("shaderpacks").join(&old_filename);
+                                            let is_disabled = old_filename.ends_with(".disabled");
+                                            let base_old = if is_disabled {
+                                                old_filename.strip_suffix(".disabled").unwrap_or(&old_filename)
+                                            } else {
+                                                &old_filename
+                                            };
+                                            let ext = std::path::Path::new(base_old).extension().and_then(|s| s.to_str()).unwrap_or("zip");
+                                            let mut target_name = format!("{}.{}", new_name, ext);
+                                            if is_disabled {
+                                                target_name.push_str(".disabled");
+                                            }
+                                            let new_path = inst.path.join("shaderpacks").join(&target_name);
+                                            if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                                                self.status_message = Some((format!("Rename failed: {}", e), true));
+                                            } else {
+                                                self.status_message = Some((format!("Renamed shader to '{}'", target_name), false));
+                                            }
+                                            let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                                            let mut list_state = ListState::default();
+                                            if !shaders.is_empty() {
+                                                list_state.select(Some(0));
+                                            }
+                                            let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                                        }
+                                        _ => {
+                                            self.state = AppState::Normal;
+                                        }
+                                    }
+                                } else {
+                                    self.state = AppState::Normal;
+                                }
+                            } else {
+                                self.state = AppState::PromptRenameAsset { instance_idx, asset_type, old_filename, input_value };
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            input_value.push(c);
+                            self.state = AppState::PromptRenameAsset { instance_idx, asset_type, old_filename, input_value };
+                        }
+                        KeyCode::Backspace => {
+                            input_value.pop();
+                            self.state = AppState::PromptRenameAsset { instance_idx, asset_type, old_filename, input_value };
+                        }
+                        _ => {
+                            self.state = AppState::PromptRenameAsset { instance_idx, asset_type, old_filename, input_value };
                         }
                     }
                 }
@@ -4176,6 +4587,54 @@ impl App {
                                     }
                                 }
                             }
+                            self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                        }
+                        KeyCode::Char('a') => {
+                            self.version_search_query.clear();
+                            self.state = AppState::SearchingModQuery { instance_idx, search_type: AssetSearchType::ResourcePack };
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            if let Some(selected) = list_state.selected() {
+                                if let Some(pack) = packs.get(selected) {
+                                    let is_disabled = pack.filename.ends_with(".disabled");
+                                    let base_old = if is_disabled {
+                                        pack.filename.strip_suffix(".disabled").unwrap_or(&pack.filename)
+                                    } else {
+                                        &pack.filename
+                                    };
+                                    let stem = std::path::Path::new(base_old).file_stem().and_then(|s| s.to_str()).unwrap_or(base_old).to_string();
+                                    self.state = AppState::PromptRenameAsset {
+                                        instance_idx,
+                                        asset_type: "resourcepack".to_string(),
+                                        old_filename: pack.filename.clone(),
+                                        input_value: stem,
+                                    };
+                                } else {
+                                    self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                                }
+                            } else {
+                                self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                            }
+                        }
+                        KeyCode::Char('d') | KeyCode::Backspace => {
+                            if let Some(selected) = list_state.selected()
+                                && let Some(pack) = packs.get(selected) {
+                                    if let Some(inst) = self.instances.get(instance_idx) {
+                                        let pack_path = inst.path.join("resourcepacks").join(&pack.filename);
+                                        if std::fs::remove_file(&pack_path).is_ok() {
+                                            self.status_message = Some((format!("Deleted resource pack '{}'", pack.filename), false));
+                                        } else {
+                                            self.status_message = Some(("Failed to delete resource pack".to_string(), true));
+                                        }
+                                        let new_packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                                        packs = new_packs;
+                                        if selected >= packs.len() && !packs.is_empty() {
+                                            list_state.select(Some(packs.len() - 1));
+                                        } else if packs.is_empty() {
+                                            list_state.select(None);
+                                        }
+                                    }
+                                }
                             self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
                         }
                         _ => {
@@ -4254,6 +4713,54 @@ impl App {
                             } else {
                                 self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
                             }
+                        }
+                        KeyCode::Char('a') => {
+                            self.version_search_query.clear();
+                            self.state = AppState::SearchingModQuery { instance_idx, search_type: AssetSearchType::Shader };
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            if let Some(selected) = list_state.selected() {
+                                if let Some(shader) = shaders.get(selected) {
+                                    let is_disabled = shader.filename.ends_with(".disabled");
+                                    let base_old = if is_disabled {
+                                        shader.filename.strip_suffix(".disabled").unwrap_or(&shader.filename)
+                                    } else {
+                                        &shader.filename
+                                    };
+                                    let stem = std::path::Path::new(base_old).file_stem().and_then(|s| s.to_str()).unwrap_or(base_old).to_string();
+                                    self.state = AppState::PromptRenameAsset {
+                                        instance_idx,
+                                        asset_type: "shaderpack".to_string(),
+                                        old_filename: shader.filename.clone(),
+                                        input_value: stem,
+                                    };
+                                } else {
+                                    self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                                }
+                            } else {
+                                self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                            }
+                        }
+                        KeyCode::Char('d') | KeyCode::Backspace => {
+                            if let Some(selected) = list_state.selected()
+                                && let Some(shader) = shaders.get(selected) {
+                                    if let Some(inst) = self.instances.get(instance_idx) {
+                                        let shader_path = inst.path.join("shaderpacks").join(&shader.filename);
+                                        if std::fs::remove_file(&shader_path).is_ok() {
+                                            self.status_message = Some((format!("Deleted shader pack '{}'", shader.filename), false));
+                                        } else {
+                                            self.status_message = Some(("Failed to delete shader pack".to_string(), true));
+                                        }
+                                        let new_shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                                        shaders = new_shaders;
+                                        if selected >= shaders.len() && !shaders.is_empty() {
+                                            list_state.select(Some(shaders.len() - 1));
+                                        } else if shaders.is_empty() {
+                                            list_state.select(None);
+                                        }
+                                    }
+                                }
+                            self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
                         }
                         _ => {
                             self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
@@ -4370,7 +4877,7 @@ impl App {
                         }
                         KeyCode::Char('a') => {
                             self.version_search_query.clear();
-                            self.state = AppState::SearchingModQuery { instance_idx };
+                            self.state = AppState::SearchingModQuery { instance_idx, search_type: AssetSearchType::Mod };
                         }
                         KeyCode::Char('d') | KeyCode::Backspace => {
                             if let Some(selected) = mod_list_state.selected()
@@ -4402,18 +4909,47 @@ impl App {
                 }
             }
 
-            AppState::SearchingModQuery { instance_idx } => {
+            AppState::SearchingModQuery { instance_idx, ref search_type } => {
                 match key.code {
                     KeyCode::Esc => {
                         if let Some(inst) = self.instances.get(instance_idx) {
-                            if let Ok(mods) = inst.get_mods() {
-                                let mut mod_list_state = ListState::default();
-                                if !mods.is_empty() {
-                                    mod_list_state.select(Some(0));
+                            match search_type {
+                                AssetSearchType::Mod => {
+                                    if let Ok(mods) = inst.get_mods() {
+                                        let mut mod_list_state = ListState::default();
+                                        if !mods.is_empty() {
+                                            mod_list_state.select(Some(0));
+                                        }
+                                        self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
+                                    } else {
+                                        self.state = AppState::Normal;
+                                    }
                                 }
-                                self.state = AppState::ModManager { instance_idx, mods, mod_list_state };
-                            } else {
-                                self.state = AppState::Normal;
+                                AssetSearchType::Shader => {
+                                    let shaders = crate::assets::list_shaderpacks(&inst.path).unwrap_or_default();
+                                    let mut list_state = ListState::default();
+                                    if !shaders.is_empty() {
+                                        list_state.select(Some(0));
+                                    }
+                                    let has_shader_support = crate::assets::detect_shader_support(&inst.path);
+                                    self.state = AppState::ShaderPackManager { instance_idx, shaders, list_state, has_shader_support };
+                                }
+                                AssetSearchType::ResourcePack => {
+                                    let packs = crate::assets::list_resourcepacks(&inst.path).unwrap_or_default();
+                                    let mut list_state = ListState::default();
+                                    if !packs.is_empty() {
+                                        list_state.select(Some(0));
+                                    }
+                                    self.state = AppState::ResourcePackManager { instance_idx, packs, list_state };
+                                }
+                                AssetSearchType::Datapack { .. } => {
+                                    let worlds = crate::assets::list_worlds(&inst.path).unwrap_or_default();
+                                    let mut list_state = ListState::default();
+                                    if !worlds.is_empty() {
+                                        list_state.select(Some(0));
+                                    }
+                                    self.state = AppState::WorldManager { instance_idx, worlds, list_state, confirm_delete: None };
+                                }
                             }
                         } else {
                             self.state = AppState::Normal;
@@ -4428,11 +4964,19 @@ impl App {
                             let query_clone = query.clone();
                             if let Some(inst) = self.instances.get(instance_idx) {
                                 let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
+                                let search_type_clone = search_type.clone();
                                 tokio::spawn(async move {
-                                    let res = client.search_mods(&query_clone, Some(&game_version), loader.as_deref()).await;
+                                    let type_filter = match search_type_clone {
+                                        AssetSearchType::Mod => "mod",
+                                        AssetSearchType::Shader => "shader",
+                                        AssetSearchType::ResourcePack => "resourcepack",
+                                        AssetSearchType::Datapack { .. } => "datapack",
+                                    };
+                                    let loader_filter = if type_filter == "mod" { loader.as_deref() } else { None };
+                                    let res = client.search_projects(&query_clone, Some(&game_version), loader_filter, type_filter).await;
                                     let _ = tx.send(res);
                                 });
-                                self.state = AppState::SearchingModLoading { instance_idx, query, rx };
+                                self.state = AppState::SearchingModLoading { instance_idx, search_type: search_type.clone(), query, rx };
                             }
                         }
                     }
@@ -4448,11 +4992,11 @@ impl App {
 
             AppState::SearchingModLoading { .. } => {}
 
-            AppState::SearchingModResults { instance_idx, ref query, ref hits, ref mut list_state } => {
+            AppState::SearchingModResults { instance_idx, ref search_type, ref query, ref hits, ref mut list_state } => {
                 match key.code {
                     KeyCode::Esc => {
                         let q = query.clone();
-                        self.state = AppState::SearchingModQuery { instance_idx };
+                        self.state = AppState::SearchingModQuery { instance_idx, search_type: search_type.clone() };
                         self.version_search_query = q;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -4477,7 +5021,7 @@ impl App {
                                     let res = client.fetch_modpack_versions(&project_id).await;
                                     let _ = tx.send(res);
                                 });
-                                self.state = AppState::SearchingModVersionsLoading { instance_idx, hit: hit.clone(), rx };
+                                self.state = AppState::SearchingModVersionsLoading { instance_idx, search_type: search_type.clone(), hit: hit.clone(), rx };
                             }
                     }
                     _ => {}
@@ -4486,7 +5030,7 @@ impl App {
 
             AppState::SearchingModVersionsLoading { .. } => {}
 
-            AppState::SearchingModVersions { instance_idx, hit: _, ref versions, ref mut list_state } => {
+            AppState::SearchingModVersions { instance_idx, ref search_type, ref hit, ref versions, ref mut list_state } => {
                 match key.code {
                     KeyCode::Esc => {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -4495,11 +5039,19 @@ impl App {
                         let query_clone = query.clone();
                         if let Some(inst) = self.instances.get(instance_idx) {
                             let (game_version, loader) = inst.get_game_version_and_loader(&self.config.game_dir);
+                            let search_type_clone = search_type.clone();
                             tokio::spawn(async move {
-                                let res = client.search_mods(&query_clone, Some(&game_version), loader.as_deref()).await;
-                                let _ = tx.send(res);
+                                let type_filter = match search_type_clone {
+                                    AssetSearchType::Mod => "mod",
+                                    AssetSearchType::Shader => "shader",
+                                    AssetSearchType::ResourcePack => "resourcepack",
+                                    AssetSearchType::Datapack { .. } => "datapack",
+                                };
+                                let loader_filter = if type_filter == "mod" { loader.as_deref() } else { None };
+                                let res = client.search_projects(&query_clone, Some(&game_version), loader_filter, type_filter).await;
+                                  let _ = tx.send(res);
                             });
-                            self.state = AppState::SearchingModLoading { instance_idx, query, rx };
+                            self.state = AppState::SearchingModLoading { instance_idx, search_type: search_type.clone(), query, rx };
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -4529,72 +5081,126 @@ impl App {
                                 let (game_version, loader) = inst.get_game_version_and_loader(&game_dir);
                                 let game_version_clone = game_version.clone();
                                 let loader_clone = loader.clone();
+                                
+                                let project_id = hit.project_id.clone();
 
-                                tokio::spawn(async move {
-                                    let _ = tx.send(ProgressUpdate::Started {
-                                        total: 1 + dependencies.len(),
-                                        message: "Installing mod...".to_string(),
-                                    }).await;
+                                let asset_label = match search_type {
+                                    AssetSearchType::Mod => "mod",
+                                    AssetSearchType::Shader => "shader pack",
+                                    AssetSearchType::ResourcePack => "resource pack",
+                                    AssetSearchType::Datapack { .. } => "datapack",
+                                };
 
-                                    if let Some(file) = version_files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| version_files.first()) {
-                                        let _ = tx.send(ProgressUpdate::Progress {
-                                            completed: 0,
-                                            total: 1 + dependencies.len(),
-                                            current_file: file.filename.clone(),
-                                        }).await;
+                                match search_type {
+                                    AssetSearchType::Mod => {
+                                        tokio::spawn(async move {
+                                            let _ = tx.send(ProgressUpdate::Started {
+                                                total: 1 + dependencies.len(),
+                                                message: "Installing mod...".to_string(),
+                                            }).await;
 
-                                        if let Err(e) = inst.install_mod_from_url(&game_dir, &file.filename, &file.url, None, true).await {
-                                            let _ = tx.send(ProgressUpdate::Error(format!("Failed to install mod {}: {}", file.filename, e))).await;
-                                            return;
-                                        }
-                                    }
-
-                                    let mut completed = 1;
-                                    let mut installed_projects = std::collections::HashSet::new();
-                                    installed_projects.insert(version_id);
-
-                                    for dep in dependencies {
-                                        if dep.dependency_type == "required" {
-                                            if let Some(dep_project_id) = dep.project_id {
-                                                if installed_projects.contains(&dep_project_id) {
-                                                    continue;
-                                                }
-
-                                                let dep_name = match api.fetch_project(&dep_project_id).await {
-                                                    Ok(p) => p.title,
-                                                    Err(_) => dep_project_id.clone(),
-                                                };
-
+                                            if let Some(file) = version_files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| version_files.first()) {
                                                 let _ = tx.send(ProgressUpdate::Progress {
-                                                    completed,
-                                                    total: 1 + completed,
-                                                    current_file: format!("Dependency: {}", dep_name),
+                                                    completed: 0,
+                                                    total: 1 + dependencies.len(),
+                                                    current_file: file.filename.clone(),
                                                 }).await;
 
-                                                if let Ok(dep_versions) = api.fetch_modpack_versions(&dep_project_id).await {
-                                                    let comp_ver = dep_versions.into_iter().find(|v| {
-                                                        v.game_versions.contains(&game_version_clone) && match loader_clone.as_deref() {
-                                                            Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
-                                                            None => true,
-                                                        }
-                                                    });
+                                                if let Err(e) = inst.install_mod_from_url(&game_dir, &file.filename, &file.url, None, true).await {
+                                                    let _ = tx.send(ProgressUpdate::Error(format!("Failed to install mod {}: {}", file.filename, e))).await;
+                                                    return;
+                                                }
+                                            }
 
-                                                    if let Some(cv) = comp_ver {
-                                                        if let Some(dep_file) = cv.files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| cv.files.first()) {
-                                                            let _ = inst.install_mod_from_url(&game_dir, &dep_file.filename, &dep_file.url, None, true).await;
+                                            let mut completed = 1;
+                                            let mut installed_projects = std::collections::HashSet::new();
+                                            installed_projects.insert(version_id);
+
+                                            for dep in dependencies {
+                                                if dep.dependency_type == "required" {
+                                                    if let Some(dep_project_id) = dep.project_id {
+                                                        if installed_projects.contains(&dep_project_id) {
+                                                            continue;
                                                         }
+
+                                                        let dep_name = match api.fetch_project(&dep_project_id).await {
+                                                            Ok(p) => p.title,
+                                                            Err(_) => dep_project_id.clone(),
+                                                        };
+
+                                                        let _ = tx.send(ProgressUpdate::Progress {
+                                                            completed,
+                                                            total: 1 + completed,
+                                                            current_file: format!("Dependency: {}", dep_name),
+                                                        }).await;
+
+                                                        if let Ok(dep_versions) = api.fetch_modpack_versions(&dep_project_id).await {
+                                                            let comp_ver = dep_versions.into_iter().find(|v| {
+                                                                v.game_versions.contains(&game_version_clone) && match loader_clone.as_deref() {
+                                                                    Some(l) => v.loaders.iter().any(|loader_name| loader_name.to_lowercase() == l.to_lowercase()),
+                                                                    None => true,
+                                                                }
+                                                            });
+
+                                                            if let Some(cv) = comp_ver {
+                                                                if let Some(dep_file) = cv.files.iter().find(|f| f.primary || f.filename.ends_with(".jar")).or_else(|| cv.files.first()) {
+                                                                    let _ = inst.install_mod_from_url(&game_dir, &dep_file.filename, &dep_file.url, None, true).await;
+                                                                }
+                                                            }
+                                                        }
+                                                        completed += 1;
                                                     }
                                                 }
-                                                completed += 1;
                                             }
-                                        }
-                                    }
 
-                                    let _ = tx.send(ProgressUpdate::Finished).await;
-                                });
+                                            let _ = tx.send(ProgressUpdate::Finished).await;
+                                        });
+                                    }
+                                    _ => {
+                                        let asset_type = match &search_type {
+                                            AssetSearchType::Shader => "shaderpack",
+                                            AssetSearchType::ResourcePack => "resourcepack",
+                                            AssetSearchType::Datapack { .. } => "datapack",
+                                            _ => unreachable!(),
+                                        };
+                                        let world_name = match &search_type {
+                                            AssetSearchType::Datapack { world_name } => Some(world_name.clone()),
+                                            _ => None,
+                                        };
+                                        tokio::spawn(async move {
+                                            let _ = tx.send(ProgressUpdate::Started {
+                                                total: 1,
+                                                message: format!("Installing {}...", asset_label),
+                                            }).await;
+
+                                            if let Some(file) = version_files.iter().find(|f| f.primary || f.filename.ends_with(".zip")).or_else(|| version_files.first()) {
+                                                let project_slug = match api.fetch_project(&project_id).await {
+                                                    Ok(p) => p.slug,
+                                                    Err(_) => project_id.clone(),
+                                                };
+                                                let extension = if file.filename.ends_with(".jar") { "jar" } else { "zip" };
+                                                let target_filename = format!("{}.{}", project_slug, extension);
+
+                                                let _ = tx.send(ProgressUpdate::Progress {
+                                                    completed: 0,
+                                                    total: 1,
+                                                    current_file: target_filename.clone(),
+                                                }).await;
+
+                                                if let Err(e) = inst.install_asset_from_url(&game_dir, &target_filename, &file.url, None, asset_type, world_name.as_deref()).await {
+                                                    let _ = tx.send(ProgressUpdate::Error(format!("Failed to install {}: {}", asset_label, e))).await;
+                                                    return;
+                                                }
+                                            }
+
+                                            let _ = tx.send(ProgressUpdate::Finished).await;
+                                        });
+                                    }
+                                }
 
                                 self.state = AppState::InstallingModProgress {
                                     instance_idx,
+                                    search_type: search_type.clone(),
                                     completed: 0,
                                     total: 1,
                                     current_file: String::new(),

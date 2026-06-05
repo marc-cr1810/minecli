@@ -17,6 +17,7 @@ pub struct AssetInfo {
     pub filename: String,
     pub size_bytes: u64,
     pub enabled: bool,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -161,6 +162,62 @@ fn zip_dir_recursive(
     Ok(())
 }
 
+fn get_resource_pack_description(path: &Path) -> Option<String> {
+    let contents = if path.is_file() {
+        let file = File::open(path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let mut pack_mcmeta = archive.by_name("pack.mcmeta").ok()?;
+        let mut contents = String::new();
+        pack_mcmeta.read_to_string(&mut contents).ok()?;
+        contents
+    } else {
+        let meta_path = path.join("pack.mcmeta");
+        if meta_path.exists() {
+            fs::read_to_string(meta_path).ok()?
+        } else {
+            return None;
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct PackMcMeta {
+        pack: PackInfo,
+    }
+    #[derive(Deserialize)]
+    struct PackInfo {
+        description: serde_json::Value,
+    }
+
+    let parsed: PackMcMeta = serde_json::from_str(&contents).ok()?;
+    match parsed.pack.description {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::String(text)) = obj.get("text") {
+                Some(text.clone())
+            } else {
+                Some(serde_json::Value::Object(obj).to_string())
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let joined: String = arr.iter().filter_map(|val| {
+                if let serde_json::Value::String(s) = val {
+                    Some(s.as_str())
+                } else if let serde_json::Value::Object(obj) = val {
+                    obj.get("text").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            }).collect();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn list_assets_in_dir(dir_path: &Path) -> Result<Vec<AssetInfo>, String> {
     if !dir_path.exists() {
         return Ok(Vec::new());
@@ -168,6 +225,7 @@ fn list_assets_in_dir(dir_path: &Path) -> Result<Vec<AssetInfo>, String> {
 
     let mut assets = Vec::new();
     let entries = fs::read_dir(dir_path).map_err(|e| e.to_string())?;
+    let is_resourcepack = dir_path.file_name().and_then(|n| n.to_str()) == Some("resourcepacks");
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -180,11 +238,17 @@ fn list_assets_in_dir(dir_path: &Path) -> Result<Vec<AssetInfo>, String> {
         };
 
         let enabled = !filename.ends_with(".disabled");
+        let description = if is_resourcepack {
+            get_resource_pack_description(&path)
+        } else {
+            None
+        };
 
         assets.push(AssetInfo {
             filename,
             size_bytes,
             enabled,
+            description,
         });
     }
 

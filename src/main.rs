@@ -260,6 +260,50 @@ enum InstanceAction {
         id: String,
         filename: String,
     },
+    /// Search Modrinth for shader packs
+    SearchShader {
+        /// Instance ID to check compatibility against
+        id: String,
+        /// Search query
+        query: String,
+    },
+    /// Add/install a shader pack from Modrinth
+    AddShader {
+        /// Instance ID
+        id: String,
+        /// Modrinth project ID or slug
+        project_id: String,
+    },
+    /// Search Modrinth for resource packs
+    SearchResourcePack {
+        /// Instance ID to check compatibility against
+        id: String,
+        /// Search query
+        query: String,
+    },
+    /// Add/install a resource pack from Modrinth
+    AddResourcePack {
+        /// Instance ID
+        id: String,
+        /// Modrinth project ID or slug
+        project_id: String,
+    },
+    /// Search Modrinth for datapacks
+    SearchDatapack {
+        /// Instance ID to check compatibility against
+        id: String,
+        /// Search query
+        query: String,
+    },
+    /// Add/install a datapack to a world from Modrinth
+    AddDatapack {
+        /// Instance ID
+        id: String,
+        /// World folder name
+        world: String,
+        /// Modrinth project ID or slug
+        project_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1280,6 +1324,130 @@ async fn handle_instance_command(action: InstanceAction) -> Result<(), String> {
             assets::delete_screenshot(&inst.path, &filename)?;
             println!("Deleted screenshot '{}' from instance '{}'.", filename.yellow(), id.yellow());
         }
+        InstanceAction::SearchShader { id, query } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            println!("Searching Modrinth for shaders matching '{}'...", query.clone().cyan());
+            let hits = api.search_projects(&query, Some(&game_version), loader.as_deref(), "shader").await?;
+            if hits.is_empty() {
+                println!("No matching shaders found.");
+            } else {
+                println!("Matching Shaders:");
+                for hit in hits {
+                    println!(
+                        "  • {} (Slug: {}, ID: {})\n    Description: {}\n    Downloads: {}",
+                        hit.title.green().bold(),
+                        hit.slug.yellow(),
+                        hit.project_id.yellow(),
+                        hit.description,
+                        hit.downloads
+                    );
+                }
+            }
+        }
+        InstanceAction::AddShader { id, project_id } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            install_asset_from_modrinth(
+                &api,
+                &config.game_dir,
+                &mut inst,
+                &project_id,
+                &game_version,
+                loader.as_deref(),
+                "shaderpack",
+                None,
+            ).await?;
+            println!("{}", "Finished adding shader pack!".green().bold());
+        }
+        InstanceAction::SearchResourcePack { id, query } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            println!("Searching Modrinth for resource packs matching '{}'...", query.clone().cyan());
+            let hits = api.search_projects(&query, Some(&game_version), loader.as_deref(), "resourcepack").await?;
+            if hits.is_empty() {
+                println!("No matching resource packs found.");
+            } else {
+                println!("Matching Resource Packs:");
+                for hit in hits {
+                    println!(
+                        "  • {} (Slug: {}, ID: {})\n    Description: {}\n    Downloads: {}",
+                        hit.title.green().bold(),
+                        hit.slug.yellow(),
+                        hit.project_id.yellow(),
+                        hit.description,
+                        hit.downloads
+                    );
+                }
+            }
+        }
+        InstanceAction::AddResourcePack { id, project_id } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            install_asset_from_modrinth(
+                &api,
+                &config.game_dir,
+                &mut inst,
+                &project_id,
+                &game_version,
+                loader.as_deref(),
+                "resourcepack",
+                None,
+            ).await?;
+            println!("{}", "Finished adding resource pack!".green().bold());
+        }
+        InstanceAction::SearchDatapack { id, query } => {
+            let inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            println!("Searching Modrinth for datapacks matching '{}'...", query.clone().cyan());
+            let hits = api.search_projects(&query, Some(&game_version), loader.as_deref(), "datapack").await?;
+            if hits.is_empty() {
+                println!("No matching datapacks found.");
+            } else {
+                println!("Matching Datapacks:");
+                for hit in hits {
+                    println!(
+                        "  • {} (Slug: {}, ID: {})\n    Description: {}\n    Downloads: {}",
+                        hit.title.green().bold(),
+                        hit.slug.yellow(),
+                        hit.project_id.yellow(),
+                        hit.description,
+                        hit.downloads
+                    );
+                }
+            }
+        }
+        InstanceAction::AddDatapack { id, world, project_id } => {
+            let mut inst = Instance::load(&id, config.game_dir.join("instances").join(&id))?;
+            let (game_version, loader) = inst.get_game_version_and_loader(&config.game_dir);
+            let api = ApiClient::new();
+            let worlds = assets::list_worlds(&inst.path)?;
+            if !worlds.iter().any(|w| w.name == world || w.folder_name == world) {
+                println!(
+                    "{} World '{}' does not exist yet. Pre-creating saves folder structure to provision the datapack before world generation...",
+                    "Notice:".yellow().bold(),
+                    world.clone().cyan()
+                );
+                let dp_dir = inst.path.join("saves").join(&world).join("datapacks");
+                std::fs::create_dir_all(&dp_dir).map_err(|e| format!("Failed to pre-create world folder: {}", e))?;
+            }
+            install_asset_from_modrinth(
+                &api,
+                &config.game_dir,
+                &mut inst,
+                &project_id,
+                &game_version,
+                loader.as_deref(),
+                "datapack",
+                Some(&world),
+            ).await?;
+            println!("{}", "Finished adding datapack!".green().bold());
+        }
     }
     Ok(())
 }
@@ -1460,6 +1628,62 @@ async fn handle_cli_launch(
     let launcher = Launcher::new(config);
     launcher.launch(&instance, &account).await?;
 
+    Ok(())
+}
+
+async fn install_asset_from_modrinth(
+    api: &ApiClient,
+    game_dir: &std::path::Path,
+    inst: &mut Instance,
+    project_id_or_slug: &str,
+    game_version: &str,
+    loader: Option<&str>,
+    asset_type: &str,
+    world_name: Option<&str>,
+) -> Result<(), String> {
+    println!("Resolving version for {} '{}'...", asset_type, project_id_or_slug.cyan());
+    
+    let versions = api.fetch_modpack_versions(project_id_or_slug).await?;
+    let compatible_version = versions.into_iter().find(|v| {
+        let matches_game = v.game_versions.contains(&game_version.to_string());
+        let matches_loader = match loader {
+            Some(l) => v.loaders.is_empty() || v.loaders.iter().any(|loader_name| {
+                let ln = loader_name.to_lowercase();
+                ln == l.to_lowercase() || ln == "minecraft" || ln == "canvas" || ln == "iris" || ln == "optifine"
+            }),
+            None => true,
+        };
+        matches_game && matches_loader
+    });
+
+    let ver = match compatible_version {
+        Some(v) => v,
+        None => {
+            return Err(format!(
+                "No compatible version of {} '{}' found for Minecraft {}.",
+                asset_type,
+                project_id_or_slug,
+                game_version
+            ));
+        }
+    };
+
+    let file = ver.files.iter().find(|f| f.primary || f.filename.ends_with(".zip"))
+        .or_else(|| ver.files.first())
+        .ok_or_else(|| format!("No file found in version {} for {}", ver.name, project_id_or_slug))?;
+
+    let project_slug = match api.fetch_project(project_id_or_slug).await {
+        Ok(p) => p.slug,
+        Err(_) => project_id_or_slug.to_string(),
+    };
+
+    let extension = if file.filename.ends_with(".jar") { "jar" } else { "zip" };
+    let target_filename = format!("{}.{}", project_slug, extension);
+
+    println!("Downloading {} (version: {})...", target_filename.clone().green(), ver.version_number.clone().yellow());
+    
+    inst.install_asset_from_url(game_dir, &target_filename, &file.url, None, asset_type, world_name).await?;
+    
     Ok(())
 }
 

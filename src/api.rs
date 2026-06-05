@@ -697,20 +697,23 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse modpack versions: {}", e))
     }
 
-    pub async fn search_mods(
+    pub async fn search_projects(
         &self,
         query: &str,
         game_version: Option<&str>,
         loader: Option<&str>,
+        project_type: &str,
     ) -> Result<Vec<ModrinthSearchHit>, String> {
         let url = "https://api.modrinth.com/v2/search";
         
-        let mut facets = vec![vec!["project_type:mod".to_string()]];
+        let mut facets = vec![vec![format!("project_type:{}", project_type)]];
         if let Some(v) = game_version {
             facets.push(vec![format!("versions:{}", v)]);
         }
         if let Some(l) = loader {
-            facets.push(vec![format!("categories:{}", l.to_lowercase())]);
+            if project_type == "mod" {
+                facets.push(vec![format!("categories:{}", l.to_lowercase())]);
+            }
         }
 
         let facets_json = serde_json::to_string(&facets).map_err(|e| e.to_string())?;
@@ -725,6 +728,15 @@ impl ApiClient {
             .await
             .map(|r| r.hits)
             .map_err(|e| format!("Failed to parse Modrinth search response: {}", e))
+    }
+
+    pub async fn search_mods(
+        &self,
+        query: &str,
+        game_version: Option<&str>,
+        loader: Option<&str>,
+    ) -> Result<Vec<ModrinthSearchHit>, String> {
+        self.search_projects(query, game_version, loader, "mod").await
     }
 
     pub async fn fetch_project(&self, project_id: &str) -> Result<ModrinthProject, String> {
@@ -778,6 +790,7 @@ pub struct PrismMetaIndex {
 pub struct ModrinthSearchHit {
     #[serde(rename = "project_id")]
     pub project_id: String,
+    pub slug: String,
     pub title: String,
     pub description: String,
     pub downloads: u64,
